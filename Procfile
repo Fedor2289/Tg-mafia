@@ -1,1 +1,1 @@
-worker: python horror_bot_v18.py
+worker: python horror_bot_v10.py
