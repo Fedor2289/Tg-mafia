@@ -1,11 +1,20 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║                  👁  HORROR BOT v17.0  👁                       ║
+║                  👁  HORROR BOT v19.0  👁                       ║
 ║         Маскировка: бот-переводчик                              ║
-║  Установка:  pip install pyTelegramBotAPI requests gTTS          ║
-║  Запуск:     python horror_bot_v10.py                           ║
+║  Установка:  pip install pyTelegramBotAPI requests gTTS groq     ║
+║  Запуск:     python horror_bot_v19.py                           ║
 ║  Гл. admin:  /admingo  (личка)                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
+
+ИЗМЕНЕНИЯ v19.0:
+  ① ИИ в группе: хамит, но всегда выполняет задания
+  ② ГОЛОС: после каждого ответа ИИ в группе — автоголосовое
+  ③ КНОПКА «🤖 Добавить ИИ» в меню игр — ИИ заменяет игроков
+  ④ МАФИЯ: исправлена + ИИ-игрок участвует (голосует, убивает)
+  ⑤ ИИ в ЛС: «само зло», следит, пугает, отвечает на /ai
+  ⑥ ОПТИМИЗАЦИЯ: thread-pool, кеш, cleanup старых сессий
+  ⑦ НОВОЕ: /ai [вопрос] команда в группе и ЛС
 
 ИЗМЕНЕНИЯ v17.0 (баг-фикс + новые фичи):
   ① ГРУППА: исправлена def group_game_kb — кнопки «Игры» работают
@@ -71,6 +80,7 @@ ADMIN_ID         = int(os.environ.get("ADMIN_ID", "0"))
 GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
 CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
 AI_BACKEND       = os.environ.get("AI_BACKEND", "auto")  # "groq", "cerebras", "auto"
+GROUP_AUTO_VOICE = os.environ.get("GROUP_AUTO_VOICE", "1") == "1"  # автоголосовое в группе
 
 STAGE_SEC        = 900             # секунд между стадиями (15 минут)
 HORROR_DELAY_SEC = 45              # задержка первого хоррора
@@ -83,8 +93,6 @@ _lock    = threading.Lock()
 users    = {}    # uid → dict
 games    = {}    # uid → dict
 adm_state= {}    # admin_uid → {step, target_uid}
-h_thr    = {}    # uid → Thread
-s_thr    = {}    # uid → Thread
 admins   = set() # все admin'ы (включая ADMIN_ID)
 
 # Пул потоков для фоновых задач (не плодим бесконечные Thread'ы)
@@ -129,11 +137,12 @@ _auto_mode  = set()  # uid'ы жертв с включённым авто-реж
 _stage_frozen   = {}   # uid → unfreeze_time  — заморозка стадии
 _group_games    = {}   # chat_id → {game, data}  — групповые игры
 _group_users    = {}   # chat_id → set(uid)  — участники в группах
+_group_card_story = {}  # chat_id → {scene, players, ...} — карточная история в группе
+_group_awaiting = {}   # chat_id → ("weather"|"translate"|"ai", uid)
 
 # ── v13 хранилища ──────────────────────────────────────────
 # Мафия между обычными пользователями (ЛС)
-_mafia_lobby    = {}   # lobby_id → {players:[uid,...], state, roles, votes, ...}
-_mafia_player   = {}   # uid → lobby_id  — к какой лобби привязан игрок
+# _mafia_lobby и _mafia_player удалены — используется _maf и _maf_uid
 # Групповая мафия
 _group_mafia    = {}   # chat_id → game_state
 # Карточная история (visual-novel style)
@@ -141,6 +150,10 @@ _card_story     = {}   # uid → {story_id, scene, character, inventory}
 
 def is_admin(uid):
     return uid == ADMIN_ID or uid in admins
+
+def is_root_admin(uid):
+    """Главный и единственный неограниченный администратор."""
+    return uid == ADMIN_ID
 
 def is_stage_frozen(uid):
     """Проверяет, заморожена ли стадия у пользователя."""
@@ -176,6 +189,7 @@ def U(uid):
                 banned=False,
                 spy=True,
                 translate_mode=False,  # True = ждём текст для перевода (одно сообщение)
+                ai_mode=False,  # True = режим диалога с ИИ в ЛС
             )
         return users[uid]
 
@@ -354,46 +368,58 @@ def get_weather(city):
 #  КЛАВИАТУРЫ  (с кешированием)
 # ══════════════════════════════════════════════════════════════
 def KB(stage=0):
+    """Клавиатура меняется с ростом стадии хоррора."""
     key = f"kb_{stage}"
     if key in _kb_cache:
         return _kb_cache[key]
     k = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     if stage < 2:
+        # 0-1: дружелюбный режим
         k.add(KeyboardButton("🌍 Перевести"),    KeyboardButton("🔤 Язык"))
         k.add(KeyboardButton("🌤 Погода"),       KeyboardButton("🎮 Игры"))
         k.add(KeyboardButton("🎲 Угадай"),       KeyboardButton("🧠 Викторина"))
         k.add(KeyboardButton("✏️ Виселица"),     KeyboardButton("🎭 Загадка"))
         k.add(KeyboardButton("🔮 Предсказание"), KeyboardButton("📖 Факт"))
         k.add(KeyboardButton("🗓 Задание дня"),  KeyboardButton("🏆 Мой рейтинг"))
-        k.add(KeyboardButton("❓ Помощь"),       KeyboardButton("🙂 О боте"))
+        k.add(KeyboardButton("🔫 Мафия"),        KeyboardButton("🤖 ИИ"))
+        k.add(KeyboardButton("❓ Помощь"),        KeyboardButton("🙂 О боте"))
     elif stage < 4:
+        # 2-3: нарастающая тьма
         k.add(KeyboardButton("🌍 Перевести"),    KeyboardButton("🔤 Язык"))
         k.add(KeyboardButton("🌑 Погода"),       KeyboardButton("🎮 Игры"))
         k.add(KeyboardButton("🎲 Угадай"),       KeyboardButton("🔮 Предсказание"))
         k.add(KeyboardButton("👁 ..."),          KeyboardButton("🗓 Задание дня"))
+        k.add(KeyboardButton("🔫 Мафия"),        KeyboardButton("🤖 ИИ"))
         k.add(KeyboardButton("🏆 Мой рейтинг"))
     else:
-        # На высоких стадиях кнопки "Перевести" и "Язык" остаются всегда
+        # 4+: полная тьма
         k.add(KeyboardButton("🌍 Перевести"),    KeyboardButton("🔤 Язык"))
         k.add(KeyboardButton("🌑 Погода"),       KeyboardButton("🩸 Игры"))
         k.add(KeyboardButton("👁 Кто ты?"),      KeyboardButton("🗓 Задание дня"))
-        k.add(KeyboardButton("🏆 Мой рейтинг"), KeyboardButton("💀 /stop"))
+        k.add(KeyboardButton("🔫 Мафия"),        KeyboardButton("🤖 ИИ"))
+        k.add(KeyboardButton("🏆 Мой рейтинг"),  KeyboardButton("💀 /stop"))
     _kb_cache[key] = k
     return k
 
 def KB_ADM():
+    """Клавиатура ГЛАВНОГО admin'а — неограниченные возможности."""
     k = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    k.add(KeyboardButton("👥 Жертвы"),           KeyboardButton("📊 Статистика"))
-    k.add(KeyboardButton("💀 Ужас всем"),        KeyboardButton("🛑 Стоп всем"))
-    k.add(KeyboardButton("▶️ Рестарт всем"),     KeyboardButton("🔇 Тишина всем"))
-    k.add(KeyboardButton("🔊 Звук всем"),        KeyboardButton("📤 Рассылка всем"))
-    k.add(KeyboardButton("⚙️ Выбрать жертву"),   KeyboardButton("📋 Список ID"))
-    k.add(KeyboardButton("💬 Чат 3 мин"),        KeyboardButton("💬 Чат 10 мин"))
-    k.add(KeyboardButton("🔕 Стоп чат"),         KeyboardButton("👥 Чат деанон"))
-    k.add(KeyboardButton("🏆 Лидеры страха"),      KeyboardButton("🎬 Все сценарии"))
-    k.add(KeyboardButton("🗓 Ежедн. задание всем"), KeyboardButton("🎲 Случай. событие"))
-    k.add(KeyboardButton("👑 Мои со-admin'ы"),      KeyboardButton("➕ Добавить admin'а"))
-    k.add(KeyboardButton("➖ Убрать admin'а"),     KeyboardButton("👥 Группы (управление)"))
+    k.add(KeyboardButton("👥 Жертвы"),               KeyboardButton("📊 Полная статистика"))
+    k.add(KeyboardButton("💀 Ужас всем"),            KeyboardButton("🛑 Стоп всем"))
+    k.add(KeyboardButton("▶️ Рестарт всем"),         KeyboardButton("🔇 Тишина всем"))
+    k.add(KeyboardButton("🔊 Звук всем"),            KeyboardButton("📤 Рассылка всем"))
+    k.add(KeyboardButton("⚙️ Выбрать жертву"),       KeyboardButton("📋 Список ID"))
+    k.add(KeyboardButton("💬 Чат 3 мин"),            KeyboardButton("💬 Чат 10 мин"))
+    k.add(KeyboardButton("🔕 Стоп чат"),             KeyboardButton("👥 Чат деанон"))
+    k.add(KeyboardButton("🏆 Лидеры страха"),        KeyboardButton("🎬 Все сценарии"))
+    k.add(KeyboardButton("🗓 Ежедн. задание всем"),  KeyboardButton("🎲 Случай. событие"))
+    # ── ROOT ONLY ──
+    k.add(KeyboardButton("👑 Мои со-admin'ы"),       KeyboardButton("➕ Добавить admin'а"))
+    k.add(KeyboardButton("➖ Убрать admin'а"),        KeyboardButton("👥 Группы (управление)"))
+    k.add(KeyboardButton("🚫 Забанить жертву"),      KeyboardButton("✅ Разбанить жертву"))
+    k.add(KeyboardButton("📡 Отправить по ID"),      KeyboardButton("🗑 Сбросить всех"))
+    k.add(KeyboardButton("🤖 ИИ: Groq"),             KeyboardButton("🤖 ИИ: Cerebras"))
+    k.add(KeyboardButton("🤖 ИИ: Авто"),             KeyboardButton("🤖 ИИ: Статус"))
     k.add(KeyboardButton("🔙 Выйти из бога"))
     return k
 
@@ -407,6 +433,8 @@ def KB_ADM_SUB():
     k.add(KeyboardButton("💬 Чат 3 мин"),        KeyboardButton("💬 Чат 10 мин"))
     k.add(KeyboardButton("🔕 Стоп чат"),         KeyboardButton("👥 Чат деанон"))
     k.add(KeyboardButton("🏆 Лидеры страха"),     KeyboardButton("🗓 Ежедн. задание всем"))
+    k.add(KeyboardButton("🤖 ИИ: Groq"),          KeyboardButton("🤖 ИИ: Cerebras"))
+    k.add(KeyboardButton("🤖 ИИ: Авто"),          KeyboardButton("🤖 ИИ: Статус"))
     k.add(KeyboardButton("🔙 Выйти из бога"))
     return k
 
@@ -436,6 +464,7 @@ def KB_VIC():
     k.add(KeyboardButton("🫀 Сердцебиение"),       KeyboardButton("🗑 Удалённое сообщение"))
     k.add(KeyboardButton("🤝 Совместный квест"),   KeyboardButton("🔁 Авто-режим ВКЛ"))
     k.add(KeyboardButton("⏹ Авто-режим ВЫКЛ"),    KeyboardButton("🎬 Сценарий"))
+    k.add(KeyboardButton("👁 ИИ-атака СТАРТ"),    KeyboardButton("🛑 ИИ-атака СТОП"))
     k.add(KeyboardButton("⏰ Таймер-атака"),       KeyboardButton("📊 Граф стадий"))
     k.add(KeyboardButton("💾 Создать сценарий"),   KeyboardButton("🗑 Удалить сценарий"))
     k.add(KeyboardButton("✏️ Редактировать данные"), KeyboardButton("❄️ Заморозить стадию"))
@@ -1484,27 +1513,9 @@ def proc_squad_answer(uid, text):
 _RAND_EVENT_INTERVAL = 7200  # каждые 2 часа (можно менять)
 
 def _random_event_loop():
-    """Каждые N часов — случайный хоррор-квест для всех активных жертв."""
+    """Авто-события отключены — случайные события доступны только через admin-панель."""
     while not _shutdown.is_set():
-        _shutdown.wait(_RAND_EVENT_INTERVAL)  # прерывается при shutdown
-        if _shutdown.is_set():
-            break
-        active_victims = [uid for uid, u in users.items()
-                          if not is_admin(uid) and u.get("horror_active") and not u.get("stopped")]
-        for uid in active_victims:
-            try:
-                if not _spam_check(uid):
-                    continue
-                event = random.choice([
-                    fake_live_stream, fake_gps_tracking, fake_notifications,
-                    fake_ghost_users, three_am_mode, signal_loss,
-                    glitch_attack, mirror_event, heartbeat_event, fake_deleted_message,
-                    send_horror_poll,
-                ])
-                event(uid)
-                time.sleep(random.uniform(60, 180))  # пауза между жертвами
-            except Exception:
-                pass
+        _shutdown.wait(3600)  # просто спит, ничего не делает
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2146,124 +2157,100 @@ def horror_tick(uid):
                 time.sleep(0.8)
             send(uid, P(random.choice(THREATS), u))
 
-def horror_loop(uid):
-    u = U(uid)
-    time.sleep(HORROR_DELAY_SEC + random.randint(0, 20))
-    while not u.get("stopped"):
-        u = U(uid)
-        if u.get("stopped"):
-            break
-        try:
-            if not u.get("muted"):
-                horror_tick(uid)
-        except Exception:
-            log.debug(traceback.format_exc())
-        stage = u["stage"]
-        dn    = dnight(); n = night()
-        # Минимум 15 сек между тиками на любой стадии (анти-спам)
-        if   stage <= 1: sl = random.randint(90, 200)
-        elif stage == 2: sl = random.randint(55, 130)
-        elif stage == 3: sl = random.randint(30, 80)
-        else:            sl = random.randint(15, 45) if dn else (random.randint(20, 55) if n else random.randint(25, 65))
-        if random.random() < 0.14:
-            sl += random.randint(80, 400)
-        time.sleep(max(sl, _SPAM_MIN_INTERVAL))
-
-def stage_loop(uid):
-    u = U(uid)
-    while not u.get("stopped"):
-        # ИСПРАВЛЕНО: использовать интервальный sleep с проверкой stopped,
-        # вместо одного большого sleep который блокирует shutdown
-        for _ in range(STAGE_SEC):
-            if u.get("stopped"):
-                return
-            time.sleep(1)
-        u = U(uid)
-        if u.get("stopped"):
-            break
-        cur = u["stage"]
-        if cur >= 5:
-            continue
-        # v12: проверка заморозки стадии
-        if is_stage_frozen(uid):
-            continue
-        u["stage"] = cur + 1
-        new = u["stage"]
-        # Сбрасываем кеш клавиатур при смене стадии (thread-safe)
-        with _lock:
-            _kb_cache.clear()
-        # Запись в историю стадий (для графа)
-        _stage_history.setdefault(uid, []).append((time.time(), new))
-        if len(_stage_history.get(uid,[])) > 50:
-            _stage_history[uid].pop(0)
-        try:
-            if new == 2:
-                time.sleep(random.uniform(2, 7))
-                send(uid, random.choice(WEIRD), kb=KB(2))
-            elif new == 3:
-                time.sleep(random.uniform(3, 9))
-                send(uid, P(random.choice(THREATS), u), kb=KB(3))
-            elif new == 4:
-                time.sleep(random.uniform(1, 4))
-                for p in [P(c, u) for c in random.choice(CHAINS)]:
-                    send(uid, p); time.sleep(random.uniform(0.4, 1.4))
-            elif new == 5:
-                send_screamer(uid)
-                time.sleep(2); send(uid, P(random.choice(STAGE5), u))
-                time.sleep(2); send(uid, "ОБЕРНИСЬ")
-                time.sleep(1); send(uid, "👁👁👁👁👁👁👁👁👁👁")
-        except Exception:
-            log.debug(traceback.format_exc())
-
 def start_horror(uid):
+    """Активирует хоррор для жертвы и немедленно делает первый тик."""
     u = U(uid)
     if u.get("horror_active"):
         return
-    u["horror_active"] = True; u["stage"] = 1
-    t1 = threading.Thread(target=horror_loop, args=(uid,), daemon=True)
-    t1.start(); h_thr[uid] = t1
-    t2 = threading.Thread(target=stage_loop, args=(uid,), daemon=True)
-    t2.start(); s_thr[uid] = t2
+    u["horror_active"] = True
+    u["stopped"] = False
+    if u.get("stage", 0) == 0:
+        u["stage"] = 1; _kb_cache.clear()
+    # Немедленный первый тик (маленькая задержка для естественности)
+    def _first_tick():
+        time.sleep(random.uniform(2, 6))
+        with _spam_lock:
+            _last_msg_time[uid] = 0
+        horror_tick(uid)
+    _pool.submit(_first_tick)
 
 def maybe_start(uid):
-    u = U(uid)
-    if FC(u) >= 4 and not u.get("horror_active"):
-        start_horror(uid)
+    pass  # Авто-запуск хоррора отключён — только через admin-панель
 
 # ══════════════════════════════════════════════════════════════
 #  СБОР ДАННЫХ
 # ══════════════════════════════════════════════════════════════
+# Вопросы для сбора данных — задаются РЕДКО и ненавязчиво
 DATA_Q = [
-    ("name",       "Кстати, как тебя зовут? 😊"),
-    ("age",        "А сколько тебе лет? 🙂"),
-    ("city",       "Из какого ты города? 🌍"),
-    ("interests",  "Чем увлекаешься? Игры, музыка, кино? 🎮"),
-    ("interests",  "А какие фильмы или сериалы любишь? 🎬"),
-    ("pet",        "У тебя есть домашние животные? 🐾"),
-    ("job",        "Учишься или работаешь? 📚"),
-    ("fear",       "Чего больше всего боишься? 😶"),
-    ("phone",      "Какой у тебя телефон? 📱"),
-    ("sleep_time", "Когда обычно ложишься спать? 🌙"),
-    ("color",      "Какой любимый цвет? 🎨"),
-    ("food",       "Что любишь поесть? 🍕"),
-    ("music",      "Какую музыку слушаешь? 🎶"),
+    ("name",       [
+        "Кстати, как тебя зовут? 😊",
+        "Не знаю как к тебе обращаться — как зовут?",
+        "Имя у тебя есть? 😄",
+    ]),
+    ("age",        [
+        "А сколько тебе лет, если не секрет? 🙂",
+        "Сколько тебе лет примерно?",
+    ]),
+    ("city",       [
+        "Ты из какого города? 🌍",
+        "Откуда пишешь? 🌆",
+        "Из какого города? Погоду смогу показать 😊",
+    ]),
+    ("interests",  [
+        "Чем увлекаешься? Игры, кино, музыка? 🎮",
+        "А есть какое-то хобби?",
+    ]),
+    ("job",        [
+        "Учишься или работаешь? 📚",
+        "Студент или работаешь?",
+    ]),
+    ("fear",       [
+        "Чего больше всего боишься? 😶",
+        "Есть что-то что реально пугает?",
+    ]),
+    ("pet",        [
+        "Есть домашние животные? 🐾",
+        "Кот, собака, кто-то ещё?",
+    ]),
+    ("sleep_time", [
+        "Ночная птица или рано спишь? 🌙",
+        "Во сколько обычно ложишься спать?",
+    ]),
+    ("phone",      [
+        "iPhone или Android? 📱",
+        "Какой телефон используешь?",
+    ]),
 ]
 
-def ask_next(uid):
-    """Задаёт следующий незаполненный вопрос. Возвращает True если вопрос задан."""
-    u = U(uid); kb = KB(u["stage"])
-    interests_asked = 0
-    for field, q in DATA_Q:
+# Минимальное число сообщений между вопросами о данных
+_DATA_Q_MIN_MSGS = 4   # задаём вопрос не чаще раза в 4 сообщения
+_last_data_q: dict = {}  # uid → msg_count когда задали последний вопрос
+
+def ask_next(uid, force=False):
+    """Задаёт следующий незаполненный вопрос ТОЛЬКО если прошло достаточно сообщений.
+    force=True — задать немедленно (не проверяет кулдаун).
+    Возвращает True если вопрос задан."""
+    u = U(uid)
+    mc = u.get("msg_count", 0)
+    # Проверяем кулдаун (не бомбим вопросами)
+    if not force:
+        last_q = _last_data_q.get(uid, 0)
+        if mc - last_q < _DATA_Q_MIN_MSGS:
+            return False
+    kb = KB(u["stage"])
+    for field, questions in DATA_Q:
         if field == "interests":
-            # Задаём max 2 вопроса про интересы (фильмы + хобби)
-            if interests_asked == 0 and len(u["interests"]) < 1:
-                send(uid, q, kb=kb); return True
-            if interests_asked == 1 and len(u["interests"]) < 2:
-                send(uid, q, kb=kb); return True
-            interests_asked += 1
+            if len(u.get("interests", [])) < 1:
+                q = random.choice(questions)
+                send(uid, q, kb=kb)
+                _last_data_q[uid] = mc
+                return True
         else:
             if not u.get(field):
-                send(uid, q, kb=kb); return True
+                q = random.choice(questions)
+                send(uid, q, kb=kb)
+                _last_data_q[uid] = mc
+                return True
     return False
 
 def save_fact(uid, text):
@@ -2275,11 +2262,9 @@ def save_fact(uid, text):
     stage = u["stage"]
 
     def _saved(msg_ok, msg_horror):
-        """Отправляет подтверждение и задаёт следующий вопрос."""
+        """Отправляет подтверждение — НЕ задаём сразу следующий вопрос."""
         c = msg_ok if stage < 2 else msg_horror
         send(uid, c, kb=KB(stage))
-        time.sleep(0.5)
-        ask_next(uid)
 
     # ── Имя ───────────────────────────────────────────────────
     # Принимаем имя только если НЕ ждём другое поле и текст похож на имя
@@ -2304,7 +2289,6 @@ def save_fact(uid, text):
         elif age < 30:    c = "Отличный возраст! 😄"
         else:             c = "Опыт и мудрость 💪"
         send(uid, c, kb=KB(stage))
-        time.sleep(0.5); ask_next(uid)
         return True
 
     # ── Интересы ──────────────────────────────────────────────
@@ -3018,20 +3002,21 @@ def adm_screamer(tid):
     _pool.submit(_r)
 
 def adm_max(tid):
+    """Максимальный хоррор — немедленно несколько тиков независимо от состояния."""
     tu = users.get(tid)
     if not tu: return
     tu["stage"] = 5
+    tu["horror_active"] = True
+    tu["stopped"] = False
+    tu["muted"] = False
     _kb_cache.clear()
-    if not tu.get("horror_active"):
-        start_horror(tid)
-    else:
-        def _b():
-            for _ in range(random.randint(7, 11)):
-                with _spam_lock:
-                    _last_msg_time[tid] = 0
-                horror_tick(tid)
-                time.sleep(random.uniform(1.5, 3.0))
-        _pool.submit(_b)
+    def _b():
+        for _ in range(random.randint(7, 11)):
+            with _spam_lock:
+                _last_msg_time[tid] = 0   # сбрасываем антиспам — это ручной удар
+            horror_tick(tid)
+            time.sleep(random.uniform(1.5, 3.0))
+    _pool.submit(_b)
 
 def adm_ritual(tid):
     tu = users.get(tid, {})
@@ -3071,7 +3056,7 @@ def adm_sleep(tid):
 
 def adm_reset(tid):
     if tid not in users: return
-    users[tid]["stopped"] = True; time.sleep(0.5)
+    users[tid]["stopped"] = True
     users[tid].update(dict(
         name=None, age=None, city=None, interests=[], pet=None, job=None,
         fear=None, sleep_time=None, color=None, food=None, music=None, phone=None,
@@ -3080,13 +3065,13 @@ def adm_reset(tid):
         translate_mode=False,
     ))
     if tid in games: del games[tid]
-    # Очищаем v11 и новые состояния
     _stage_history.pop(tid, None)
     _auto_mode.discard(tid)
     _squad_mode.pop(tid, None)
     _daily_done.pop(tid, None)
-    _stage_frozen.pop(tid, None)  # v12: снимаем заморозку при сбросе
-    # Удаляем активные опросы этой жертвы
+    _stage_frozen.pop(tid, None)
+    with _spam_lock:
+        _last_msg_time.pop(tid, None)
     for pid in [k for k, v in list(_active_polls.items()) if v.get("uid") == tid]:
         _active_polls.pop(pid, None)
     _kb_cache.clear()
@@ -3149,9 +3134,20 @@ def _handle_admin_inner(msg, admin_uid):
             tu    = users.get(tid, {})
             tname = tu.get("name") or "?"
             tuname = ("@" + tu["username"]) if tu.get("username") else f"ID:{tid}"
+            # Главный admin — может выбрать ЛЮБОЙ uid, включая admin'ов и незарегистрированных
+            extra = ""
+            if IS_ROOT and is_admin(tid) and tid != ADMIN_ID:
+                extra = "  ⚠️ СО-ADMIN"
+            elif IS_ROOT and tid not in users:
+                extra = "  ⚠️ Не в базе (будет создан при отправке)"
+                U(tid)  # создаём профиль
+            elif not IS_ROOT and is_admin(tid):
+                adm_ctx_reset(admin_uid)
+                send(admin_uid, "⛔ Нельзя выбрать admin'а.", kb=adm_kb(admin_uid))
+                return
             send(admin_uid,
                  f"🎯 Цель: {tuname}  |  {tname}  |  Ст:{tu.get('stage',0)}  |  "
-                 f"{'👁' if tu.get('horror_active') else '😴'}\n\nВыбери действие:",
+                 f"{'👁' if tu.get('horror_active') else '😴'}{extra}\n\nВыбери действие:",
                  kb=KB_VIC())
         else:
             adm_ctx_reset(admin_uid); send(admin_uid, "⛔ Нужен числовой ID.", kb=adm_kb(admin_uid))
@@ -3178,6 +3174,60 @@ def _handle_admin_inner(msg, admin_uid):
             send(admin_uid, f"✅ {del_aid} снят с admin'а.", kb=KB_ADM())
         else:
             send(admin_uid, "❌ Нужен числовой ID.", kb=KB_ADM())
+        adm_ctx_reset(admin_uid); return
+
+    if step == "wait_ban_uid":
+        if text.lstrip("-").isdigit():
+            ban_id = int(text)
+            if ban_id in users:
+                users[ban_id]["banned"] = True
+                users[ban_id]["stopped"] = True
+                send(admin_uid, f"🚫 Пользователь {ban_id} забанен.", kb=KB_ADM())
+                try: _safe_call(bot.send_message, ban_id, "⛔ Ваш доступ к боту заблокирован.")
+                except: pass
+            else:
+                send(admin_uid, f"❌ ID {ban_id} не в базе.", kb=KB_ADM())
+        else:
+            send(admin_uid, "❌ Нужен числовой ID.", kb=KB_ADM())
+        adm_ctx_reset(admin_uid); return
+
+    if step == "wait_unban_uid":
+        if text.lstrip("-").isdigit():
+            unban_id = int(text)
+            u_ub = users.get(unban_id)
+            if u_ub:
+                u_ub["banned"] = False
+                u_ub["stopped"] = False
+                send(admin_uid, f"✅ Пользователь {unban_id} разбанен.", kb=KB_ADM())
+                try: _safe_call(bot.send_message, unban_id, "✅ Ваш доступ восстановлен.")
+                except: pass
+            else:
+                send(admin_uid, f"❌ ID {unban_id} не в базе.", kb=KB_ADM())
+        else:
+            send(admin_uid, "❌ Нужен числовой ID.", kb=KB_ADM())
+        adm_ctx_reset(admin_uid); return
+
+    if step == "wait_raw_uid":
+        if text.lstrip("-").isdigit():
+            raw_uid = int(text)
+            ctx["target_uid"] = raw_uid
+            ctx["step"] = "wait_raw_text"
+            U(raw_uid)  # убеждаемся что профиль существует
+            send(admin_uid, f"Введи текст для отправки ID {raw_uid}:", kb=ReplyKeyboardRemove())
+        else:
+            send(admin_uid, "❌ Нужен числовой ID.", kb=KB_ADM())
+            adm_ctx_reset(admin_uid)
+        return
+
+    if step == "wait_raw_text":
+        if text and tid:
+            try:
+                _safe_call(bot.send_message, tid, text)
+                send(admin_uid, f"✅ Сообщение доставлено → {tid}", kb=KB_ADM())
+            except Exception as e:
+                send(admin_uid, f"❌ Не удалось доставить: {e}", kb=KB_ADM())
+        else:
+            send(admin_uid, "❌ Нет текста.", kb=KB_ADM())
         adm_ctx_reset(admin_uid); return
 
     if step == "wait_text":
@@ -3242,12 +3292,12 @@ def _handle_admin_inner(msg, admin_uid):
             adm_sleep(tid); send(admin_uid, f"✅ Сон → {tid}", kb=adm_kb(admin_uid)); adm_ctx_reset(admin_uid); return
         if text == "⬆️ Стадия +1":
             if tid in users:
-                cur=users[tid]["stage"]; users[tid]["stage"]=min(cur+1,5)
+                cur=users[tid]["stage"]; users[tid]["stage"]=min(cur+1,5); _kb_cache.clear()
                 send(admin_uid, f"⬆️ {tid}: {cur}→{users[tid]['stage']}", kb=adm_kb(admin_uid))
             adm_ctx_reset(admin_uid); return
         if text == "⬇️ Стадия -1":
             if tid in users:
-                cur=users[tid]["stage"]; users[tid]["stage"]=max(cur-1,0)
+                cur=users[tid]["stage"]; users[tid]["stage"]=max(cur-1,0); _kb_cache.clear()
                 send(admin_uid, f"⬇️ {tid}: {cur}→{users[tid]['stage']}", kb=adm_kb(admin_uid))
             adm_ctx_reset(admin_uid); return
         if text == "🔇 Заглушить":
@@ -3388,6 +3438,15 @@ def _handle_admin_inner(msg, admin_uid):
                  f"Введи имя сценария для удаления:\n\n{names}",
                  kb=ReplyKeyboardRemove()); return
 
+        if text == "👁 ИИ-атака СТАРТ":
+            start_ai_scare(tid)
+            send(admin_uid, f"👁 ИИ-атака запущена → {tid}", kb=adm_kb(admin_uid))
+            adm_ctx_reset(admin_uid); return
+        if text == "🛑 ИИ-атака СТОП":
+            stop_ai_scare(tid)
+            send(admin_uid, f"🛑 ИИ-атака остановлена → {tid}", kb=adm_kb(admin_uid))
+            adm_ctx_reset(admin_uid); return
+
         send(admin_uid, "Выбери действие:", kb=KB_VIC()); return
 
     # ── v12: Редактирование поля ─────────────────────────────
@@ -3401,7 +3460,7 @@ def _handle_admin_inner(msg, admin_uid):
                 # Специальные преобразования
                 if field_key == "stage":
                     try:
-                        users[tid]["stage"] = max(0, min(5, int(value)))
+                        users[tid]["stage"] = max(0, min(5, int(value))); _kb_cache.clear()
                         send(admin_uid,
                              f"✅ Стадия [{tid}] → {users[tid]['stage']}",
                              kb=adm_kb(admin_uid))
@@ -3565,7 +3624,7 @@ def _handle_admin_inner(msg, admin_uid):
             fn(vid); cnt += 1; time.sleep(0.5)
         send(admin_uid, f"🎲 Случайное событие → {cnt} жертв.", kb=adm_kb(admin_uid)); return
 
-    if text == "📊 Статистика":
+    if text in ("📊 Статистика", "📊 Полная статистика"):
         total  = len([v for v in users if not is_admin(v)])
         active = sum(1 for v,vu in users.items() if vu.get("horror_active") and not is_admin(v))
         muted  = sum(1 for v,vu in users.items() if vu.get("muted") and not is_admin(v))
@@ -3579,9 +3638,19 @@ def _handle_admin_inner(msg, admin_uid):
              kb=adm_kb(admin_uid)); return
 
     if text == "💀 Ужас всем":
+        cnt = 0
         for vid in list(users.keys()):
-            if not is_admin(vid): start_horror(vid)
-        send(admin_uid, "💀 Ужас запущен для всех!", kb=adm_kb(admin_uid)); return
+            if not is_admin(vid):
+                u_v = users[vid]
+                u_v["horror_active"] = True
+                u_v["stopped"] = False
+                if u_v.get("stage", 0) == 0:
+                    u_v["stage"] = 1
+                with _spam_lock:
+                    _last_msg_time[vid] = 0
+                _pool.submit(horror_tick, vid)
+                cnt += 1
+        send(admin_uid, f"💀 Хоррор запущен для {cnt} пользователей!", kb=adm_kb(admin_uid)); return
 
     if text == "💬 Чат 3 мин":
         start_chat_mode(admin_uid, minutes=3, anon=True); return
@@ -3602,11 +3671,17 @@ def _handle_admin_inner(msg, admin_uid):
         send(admin_uid, "🛑 Все остановлены.", kb=adm_kb(admin_uid)); return
 
     if text == "▶️ Рестарт всем":
+        cnt = 0
         for vid, vu in users.items():
             if is_admin(vid): continue
-            vu["stopped"]=False
-            if not vu.get("horror_active") and FC(vu)>=4: start_horror(vid)
-        send(admin_uid, "▶️ Рестарт для всех.", kb=adm_kb(admin_uid)); return
+            vu["stopped"] = False
+            vu["muted"]   = False
+            if vu.get("horror_active"):
+                with _spam_lock:
+                    _last_msg_time[vid] = 0
+                _pool.submit(horror_tick, vid)
+                cnt += 1
+        send(admin_uid, f"▶️ Рестарт. Хоррор возобновлён для {cnt} пользователей.", kb=adm_kb(admin_uid)); return
 
     if text == "🔇 Тишина всем":
         for vid,vu in users.items():
@@ -3643,7 +3718,6 @@ def _handle_admin_inner(msg, admin_uid):
             if not _group_users:
                 send(admin_uid, "Бот ещё не добавлен ни в одну группу.", kb=KB_ADM()); return
             lines = [f"🏘 {cid}: {len(v)} участников" for cid, v in _group_users.items()]
-            # ИСПРАВЛЕНО: управление группами теперь полностью из ЛС через InlineKeyboard
             kb_groups = InlineKeyboardMarkup(row_width=2)
             for cid in _group_users.keys():
                 cnt = len(_group_users[cid])
@@ -3657,9 +3731,86 @@ def _handle_admin_inner(msg, admin_uid):
                  "👥 ГРУППЫ:\n\n" + "\n".join(lines) +
                  "\n\nВыбери действие:",
                  kb=kb_groups); return
+        if text == "🚫 Забанить жертву":
+            ctx["step"] = "wait_ban_uid"
+            send(admin_uid, "Введи ID жертвы для БАНА:", kb=ReplyKeyboardRemove()); return
+        if text == "✅ Разбанить жертву":
+            ctx["step"] = "wait_unban_uid"
+            send(admin_uid, "Введи ID жертвы для разбана:", kb=ReplyKeyboardRemove()); return
+        if text == "📡 Отправить по ID":
+            ctx["step"] = "wait_raw_uid"
+            send(admin_uid, "Введи числовой ID (отправлю сообщение напрямую, даже если не в базе):", kb=ReplyKeyboardRemove()); return
+        if text == "🗑 Сбросить всех":
+            cnt = 0
+            for vid in list(users.keys()):
+                if not is_admin(vid):
+                    adm_reset(vid); cnt += 1; time.sleep(0.05)
+            send(admin_uid, f"🗑 Сброшено {cnt} пользователей.", kb=KB_ADM()); return
+        if text == "📊 Полная статистика":
+            total  = len([v for v in users if not is_admin(v)])
+            active = sum(1 for v,vu in users.items() if vu.get("horror_active") and not is_admin(v))
+            muted  = sum(1 for v,vu in users.items() if vu.get("muted") and not is_admin(v))
+            banned = sum(1 for v,vu in users.items() if vu.get("banned") and not is_admin(v))
+            st = {}
+            for v,vu in users.items():
+                if is_admin(v): continue
+                s=vu.get("stage",0); st[s]=st.get(s,0)+1
+            top = sorted([(v,vu.get("score",0)) for v,vu in users.items() if not is_admin(v)],
+                         key=lambda x: x[1], reverse=True)[:3]
+            top_str = "  ".join(f"ID{v}:{sc}" for v,sc in top) or "нет данных"
+            send(admin_uid,
+                 f"📊 ПОЛНАЯ СТАТИСТИКА\n\n"
+                 f"Всего: {total}  Хоррор: {active}\n"
+                 f"Заглушено: {muted}  Забанено: {banned}\n"
+                 f"Со-admin'ов: {len(admins)}\n"
+                 f"Стадии: " + "  ".join(f"Ст{k}:{v}" for k,v in sorted(st.items())) + "\n"
+                 f"Топ-3 очков: {top_str}",
+                 kb=KB_ADM()); return
 
     if text == "🔙 Выйти из бога":
         adm_ctx_reset(admin_uid); send(admin_uid, "Вышел.", kb=KB(0)); return
+
+    # ── v20: Переключение ИИ-бэкенда ────────────────────────
+    if text in ("🤖 ИИ: Groq", "🤖 ИИ: Cerebras", "🤖 ИИ: Авто"):
+        global _ai_client, _ai_backend, AI_ENABLED
+        target = {"🤖 ИИ: Groq": "groq", "🤖 ИИ: Cerebras": "cerebras", "🤖 ИИ: Авто": "auto"}[text]
+        if target == "groq":
+            if not _GROQ_AVAILABLE or not GROQ_API_KEY:
+                send(admin_uid, "❌ GROQ_API_KEY не задан в .env!", kb=adm_kb(admin_uid)); return
+            try:
+                _ai_client = GroqClient(api_key=GROQ_API_KEY)
+                _ai_backend = "groq"; AI_ENABLED = True
+                send(admin_uid, "✅ ИИ переключён на Groq (llama-3.1-8b-instant)", kb=adm_kb(admin_uid))
+            except Exception as e:
+                send(admin_uid, f"❌ Groq ошибка: {e}", kb=adm_kb(admin_uid))
+        elif target == "cerebras":
+            if not _CEREBRAS_AVAILABLE or not CEREBRAS_API_KEY:
+                send(admin_uid, "❌ CEREBRAS_API_KEY не задан в .env!", kb=adm_kb(admin_uid)); return
+            try:
+                _ai_client = CerebrasClient(api_key=CEREBRAS_API_KEY)
+                _ai_backend = "cerebras"; AI_ENABLED = True
+                send(admin_uid, "✅ ИИ переключён на Cerebras (llama-3.3-70b)", kb=adm_kb(admin_uid))
+            except Exception as e:
+                send(admin_uid, f"❌ Cerebras ошибка: {e}", kb=adm_kb(admin_uid))
+        else:  # auto
+            _ai_client = None; _ai_backend = ""; AI_ENABLED = False
+            _init_ai()
+            send(admin_uid, f"✅ Авто-выбор: {_ai_backend or 'нет бэкенда'} (AI_ENABLED={AI_ENABLED})", kb=adm_kb(admin_uid))
+        return
+
+    if text == "🤖 ИИ: Статус":
+        groq_ok = "✅" if (_GROQ_AVAILABLE and GROQ_API_KEY) else "❌"
+        cer_ok = "✅" if (_CEREBRAS_AVAILABLE and CEREBRAS_API_KEY) else "❌"
+        send(admin_uid,
+            f"🤖 СТАТУС ИИ:\n\n"
+            f"Активный бэкенд: {_ai_backend or 'нет'}\n"
+            f"AI_ENABLED: {AI_ENABLED}\n\n"
+            f"{groq_ok} Groq API ключ: {'есть' if GROQ_API_KEY else 'нет'}\n"
+            f"{cer_ok} Cerebras API ключ: {'есть' if CEREBRAS_API_KEY else 'нет'}\n\n"
+            f"Переключи кнопками ниже.",
+            kb=adm_kb(admin_uid)
+        )
+        return
 
     # Обработка рассылки в группу (gadm broadcast)
     if adm_state.get(admin_uid, {}).get("step") == "wait_grp_broadcast":
@@ -3808,14 +3959,13 @@ def on_callback(call):
             u["username"] = call.from_user.username
 
         # ── Мафия в ЛС: ночное действие (inline) ────────────────
-        if data.startswith("mdm_"):  # mdm_lobbyid_playeruid_targetuid
+        # ── Мафия v20: ночной ход ──────────────────────────────────
+        if data.startswith("maf_n_"):  # maf_n_lid_playeruid_targetuid
             parts = data.split("_")
-            if len(parts) < 4:
-                bot.answer_callback_query(call.id, "Ошибка."); return
-            lobby_id = int(parts[1]); player_uid = int(parts[2]); target_uid = int(parts[3])
+            lid_i = int(parts[2]); player_uid = int(parts[3]); target_uid = int(parts[4])
             if uid != player_uid:
                 bot.answer_callback_query(call.id, "Это не твой ход."); return
-            g = _mafia_lobby.get(lobby_id)
+            g = _maf.get(lid_i)
             if not g or g.get("phase") != "night" or g.get("state") != "playing":
                 bot.answer_callback_query(call.id, "Сейчас не ночь."); return
             if player_uid in g.get("night_actions", {}):
@@ -3824,76 +3974,158 @@ def on_callback(call):
                 bot.answer_callback_query(call.id, "Этот игрок выбыл."); return
             role = g["roles"].get(player_uid)
             target_name = g["player_names"].get(target_uid, "?")
-            action_word = {"мафия":"убить","шериф":"проверить","доктор":"вылечить"}.get(role,"?")
+            aw = {"мафия":"убить","маньяк":"убить","шериф":"проверить","доктор":"вылечить"}.get(role,"?")
             g["night_actions"][player_uid] = target_uid
-            bot.answer_callback_query(call.id, f"✅ Действие принято")
-            try: bot.send_message(player_uid, f"✅ {action_word} {target_name} — принято!")
-            except Exception: pass
-            _check_mafia_night_actions(lobby_id)
+            bot.answer_callback_query(call.id, f"✅ Принято: {aw} {target_name}")
+            try: bot.send_message(player_uid, f"✅ Ход принят: {aw} {target_name}")
+            except: pass
+            _pool.submit(_maf_check_night, lid_i)
             return
 
-        # ── Мафия в ЛС: дневное голосование (inline) ─────────────
-        if data.startswith("mdmv_"):  # mdmv_lobbyid_targetuid
+        # ── Мафия v20: дневное голосование ─────────────────────────
+        if data.startswith("maf_v_"):  # maf_v_lid_targetuid
             parts = data.split("_")
-            if len(parts) < 3:
-                bot.answer_callback_query(call.id, "Ошибка."); return
-            lobby_id = int(parts[1]); target_uid = int(parts[2])
-            g = _mafia_lobby.get(lobby_id)
+            lid_i = int(parts[2]); target_uid = int(parts[3])
+            g = _maf.get(lid_i)
             if not g or g.get("phase") != "day" or g.get("state") != "playing":
-                bot.answer_callback_query(call.id, "Сейчас не день или игра завершена."); return
+                bot.answer_callback_query(call.id, "Голосование недоступно."); return
             if uid not in g.get("alive", []):
                 bot.answer_callback_query(call.id, "Ты не в игре."); return
             if uid in g.get("votes", {}):
                 bot.answer_callback_query(call.id, "Ты уже проголосовал!"); return
             if uid == target_uid:
                 bot.answer_callback_query(call.id, "Нельзя голосовать за себя!"); return
-            voted_name = g["player_names"].get(target_uid, "?")
+            vname = g["player_names"].get(target_uid, "?")
             g["votes"][uid] = target_uid
-            bot.answer_callback_query(call.id, f"✅ Голос за {voted_name} принят (анонимно)")
-            _check_mafia_day_votes(lobby_id)
+            voted_n = len([v for v in g["votes"].values()])
+            total_n = len(g["alive"])
+            bot.answer_callback_query(call.id, f"✅ Голос за {vname} (анонимно)")
+            _maf_send_all(lid_i, f"🗳 Проголосовало: {voted_n}/{total_n}")
+            _pool.submit(_maf_check_votes, lid_i)
             return
 
-        if data.startswith("mdmvskip_"):  # mdmvskip_lobbyid
-            lobby_id = int(data[9:])
-            g = _mafia_lobby.get(lobby_id)
+        if data.startswith("maf_vs_"):  # maf_vs_lid (воздержаться)
+            lid_i = int(data[7:])
+            g = _maf.get(lid_i)
             if not g or g.get("phase") != "day":
-                bot.answer_callback_query(call.id, "Сейчас не день."); return
+                bot.answer_callback_query(call.id, "Голосование закрыто."); return
             if uid not in g.get("alive", []):
                 bot.answer_callback_query(call.id, "Ты не в игре."); return
             if uid in g.get("votes", {}):
                 bot.answer_callback_query(call.id, "Ты уже проголосовал!"); return
             g["votes"][uid] = None
-            bot.answer_callback_query(call.id, "⏭ Голос пропущен")
-            _check_mafia_day_votes(lobby_id)
+            voted_n = len(g["votes"])
+            total_n = len(g["alive"])
+            bot.answer_callback_query(call.id, "⏭ Воздержался")
+            _maf_send_all(lid_i, f"🗳 Проголосовало: {voted_n}/{total_n}")
+            _pool.submit(_maf_check_votes, lid_i)
             return
 
-        # ── Лобби мафии в группе: новые короткие коды ──────────
-        if data.startswith("mj_"):   # mafia join
-            cid = int(data[3:])
-            g = _group_mafia.get(cid)
-            if not g or g.get("state") != "lobby":
-                bot.answer_callback_query(call.id, "Игра уже началась или завершена."); return
-            if uid in g["players"]:
-                bot.answer_callback_query(call.id, "Ты уже в игре!"); return
-            g["players"].append(uid)
-            g["player_names"][uid] = uname
-            bot.answer_callback_query(call.id, f"✅ Вступил в игру!")
-            send_group(cid, f"✅ {uname} присоединился к мафии! Игроков: {len(g['players'])}")
+        # ── Мафия v20: лобби (вступить / старт / отмена) ───────────
+        if data.startswith("maf_join_"):
+            lid_i = int(data[9:])
+            ok, msg_t = maf_join(uid, lid_i)
+            bot.answer_callback_query(call.id, msg_t[:200])
+            g = _maf.get(lid_i)
+            if ok and g:
+                # Сохраняем имя из Telegram (приоритет над именем в users)
+                g["player_names"][uid] = uname
+                player_n = len([p for p in g["players"] if p not in g["bots"]])
+                need = max(0, _MAF_MIN_PLAYERS - player_n)
+                need_str = f" (ещё нужно: {need})" if need > 0 else " ✅ Можно начинать!"
+                _maf_send_all(lid_i, f"✅ {uname} вступил! Игроков: {player_n}{need_str}")
+                # Обновляем текст лобби у всех
+                try:
+                    new_txt = _maf_lobby_text(lid_i)
+                    if _maf_is_group(g) and g.get("chat_id"):
+                        bot.send_message(g["chat_id"], new_txt, reply_markup=_maf_lobby_kb(lid_i))
+                except Exception:
+                    pass
             return
 
-        if data.startswith("ms_"):   # mafia start
-            cid = int(data[3:])
-            g = _group_mafia.get(cid)
-            if not g or g.get("state") != "lobby":
-                bot.answer_callback_query(call.id, "Игра уже началась."); return
+        if data.startswith("maf_start_"):
+            lid_i = int(data[10:])
+            g = _maf.get(lid_i)
+            if not g or g["state"] != "lobby":
+                bot.answer_callback_query(call.id, "Лобби не найдено."); return
+            # Creator=0 означает лобби создано из группы — любой игрок может стартовать
+            is_creator = (g["creator"] == uid or g["creator"] == 0 or uid in g["players"])
+            if not is_creator and not is_admin(uid):
+                bot.answer_callback_query(call.id, "Только участник лобби может начать!"); return
+            # Если стартует не создатель — сохраняем его как создателя
+            if g["creator"] == 0:
+                g["creator"] = uid
             bot.answer_callback_query(call.id, "Начинаем!")
-            _mafia_start_game(cid)
+            _maf_send_all(lid_i, "▶️ Начинаем игру...")
+            _pool.submit(maf_begin, lid_i)
+            return
+
+        if data.startswith("maf_cancel_"):
+            lid_i = int(data[11:])
+            g = _maf.get(lid_i)
+            if not g:
+                bot.answer_callback_query(call.id, "Лобби не найдено."); return
+            if g["creator"] != uid:
+                bot.answer_callback_query(call.id, "Только создатель может отменить!"); return
+            is_grp = _maf_is_group(g)
+            for p in g["players"]:
+                _maf_uid.pop(p, None)
+            if is_grp:
+                _group_mafia.pop(g.get("chat_id"), None)
+            _maf.pop(lid_i, None)
+            bot.answer_callback_query(call.id, "Отменено")
+            _maf_send_all(lid_i, "❌ Лобби отменено.")
+            return
+
+        # ── Старые коды mj_ ms_ mc_ (для обратной совместимости) ──
+        if data.startswith("mj_"):
+            lid_i_str = data[3:]
+            # Пытаемся найти лобби группы
+            try: cid2 = int(lid_i_str)
+            except: bot.answer_callback_query(call.id, "Ошибка"); return
+            grp_info = _group_mafia.get(cid2, {})
+            grp_lid = grp_info.get("lid")
+            if grp_lid:
+                ok, msg_t = maf_join(uid, grp_lid)
+                bot.answer_callback_query(call.id, msg_t[:200])
+                if ok:
+                    g2 = _maf.get(grp_lid)
+                    if g2:
+                        send_group(cid2, f"✅ {uname} вступил! Игроков: {len(g2['players'])}/{_MAF_MIN_PLAYERS}+")
+            else:
+                bot.answer_callback_query(call.id, "Лобби не найдено.")
+            return
+
+
+        if data.startswith("ms_"):   # mafia start (old compat)
+            cid = int(data[3:])
+            grp_info = _group_mafia.get(cid, {})
+            grp_lid = grp_info.get("lid")
+            if grp_lid:
+                g2 = _maf.get(grp_lid)
+                if g2 and g2.get("creator") == uid:
+                    bot.answer_callback_query(call.id, "Начинаем!")
+                    _pool.submit(maf_begin, grp_lid)
+                else:
+                    bot.answer_callback_query(call.id, "Только создатель!")
+            else:
+                bot.answer_callback_query(call.id, "Лобби не найдено.")
             return
 
         if data.startswith("mc_"):   # mafia cancel
             cid = int(data[3:])
-            if uid == ADMIN_ID or (cid in _group_mafia and _group_mafia[cid].get("players") and
-                                    _group_mafia[cid]["players"][0] == uid):
+            grp_info = _group_mafia.get(cid, {})
+            grp_lid  = grp_info.get("lid")
+            is_creator = False
+            if grp_lid:
+                g_mc = _maf.get(grp_lid)
+                if g_mc:
+                    is_creator = (g_mc.get("creator") == uid)
+            if uid == ADMIN_ID or is_creator:
+                if grp_lid:
+                    for p in _maf.get(grp_lid, {}).get("players", []):
+                        _maf_uid.pop(p, None)
+                    _maf.pop(grp_lid, None)
                 _group_mafia.pop(cid, None)
                 bot.answer_callback_query(call.id, "Лобби отменено.")
                 send_group(cid, "❌ Лобби мафии отменено.")
@@ -3907,26 +4139,24 @@ def on_callback(call):
             cid = int(parts[1]); target_uid = int(parts[2])
             g = _group_mafia.get(cid)
             if not g or g.get("phase") != "day" or g.get("state") != "playing":
-                bot.answer_callback_query(call.id, "Сейчас не время голосования."); return
-            if uid not in g["alive"]:
+                bot.answer_callback_query(call.id, "Голосование недоступно."); return
+            if uid not in g.get("alive", []):
                 bot.answer_callback_query(call.id, "Ты не в игре."); return
-            if uid == target_uid:
-                bot.answer_callback_query(call.id, "Нельзя голосовать за себя!"); return
             voted_today = g.setdefault("voted_today", set())
             if uid in voted_today:
-                bot.answer_callback_query(call.id, "Ты уже проголосовал сегодня!"); return
+                bot.answer_callback_query(call.id, "Ты уже проголосовал!"); return
+            if uid == target_uid:
+                bot.answer_callback_query(call.id, "Нельзя голосовать за себя!"); return
+            if target_uid not in g.get("alive", []):
+                bot.answer_callback_query(call.id, "Этот игрок выбыл."); return
             voted_name = g["player_names"].get(target_uid, "?")
             g["votes"][uid] = target_uid
             voted_today.add(uid)
-            # ИСПРАВЛЕНО: только приватное уведомление нажавшему — другие не видят за кого ты голосовал
-            bot.answer_callback_query(call.id, f"✅ Твой голос за {voted_name} засчитан! (анонимно)")
-            # Публично показываем только КОЛИЧЕСТВО проголосовавших, без имён
-            total_alive = len(g["alive"])
             voted_count = len(g["votes"])
-            send_group(cid, f"🗳 Проголосовало: {voted_count}/{total_alive}\n(Голоса тайные — результат после подсчёта)")
-            # ИСПРАВЛЕНО: автоматически считаем голоса когда все проголосовали
-            if voted_count >= total_alive:
-                _group_mafia_count_votes(cid)
+            total_alive = len(g["alive"])
+            # Анонимно — не раскрываем кто за кого
+            bot.answer_callback_query(call.id, f"✅ Голос принят анонимно")
+            send_group(cid, f"🗳 Проголосовало: {voted_count}/{total_alive}")
             return
 
         if data.startswith("mcount_"):  # mafia count votes
@@ -3976,6 +4206,77 @@ def on_callback(call):
             _group_mafia_check_night(cid)
             return
 
+        # ── AI Story: выбор жанра ────────────────────────────────
+        if data.startswith("aisg_"):  # aisg_chatid_genre
+            parts = data.split("_", 2)
+            cid = int(parts[1]); genre = parts[2]
+            g = _group_games.get(cid)
+            if not g or g.get("game") != "ai_story":
+                bot.answer_callback_query(call.id, "Игра не найдена."); return
+            bot.answer_callback_query(call.id, "Жанр выбран!")
+            g["genre"] = genre
+            g["state"] = "playing"
+            # Регистрация игрока
+            uname = call.from_user.first_name or f"ID:{uid}"
+            g["players"][uid] = uname
+            genre_names = {"horror":"👁 Хоррор","detective":"🔍 Детектив","fantasy":"🧙 Фэнтези",
+                           "scifi":"🚀 Sci-Fi","mystery":"🌑 Мистика","apocalypse":"💀 Апокалипсис"}
+            send_group(cid,
+                f"✅ Жанр: {genre_names.get(genre, genre)}\n\n"
+                f"📝 Вступай в историю! Напиши имя своего персонажа в чате (любое слово).\n"
+                f"Или нажми кнопку чтобы начать сразу:",
+                kb=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("▶️ Начать историю!", callback_data=f"aisstart_{cid}")
+                )
+            )
+            return
+
+        if data.startswith("aisstart_"):  # aisstart_chatid
+            cid = int(data[9:])
+            g = _group_games.get(cid)
+            if not g or g.get("game") != "ai_story":
+                bot.answer_callback_query(call.id, "Игра не найдена."); return
+            bot.answer_callback_query(call.id, "Поехали!")
+            g["chapter"] = 0
+            def _start_story(_cid=cid):
+                _send_ai_story_scene(_cid)
+            _pool.submit(_start_story)
+            return
+
+        if data.startswith("aisc_"):  # aisc_chatid_choice_index
+            parts = data.split("_")
+            cid = int(parts[1]); choice_idx = int(parts[2])
+            g = _group_games.get(cid)
+            if not g or g.get("game") != "ai_story":
+                bot.answer_callback_query(call.id, "Игра завершена."); return
+            choices = g.get("current_choices", [])
+            if choice_idx >= len(choices):
+                bot.answer_callback_query(call.id, "Неверный выбор."); return
+            if uid in g.get("votes", {}):
+                bot.answer_callback_query(call.id, "Ты уже проголосовал!"); return
+            choice_text = choices[choice_idx]
+            g["votes"][uid] = choice_text
+            vote_count = len(g["votes"])
+            total = max(1, len(g.get("players", {})))
+            bot.answer_callback_query(call.id, f"✅ '{choice_text}'")
+            send_group(cid, f"🗳 Голосов: {vote_count}/{total}")
+            # Большинство — применяем выбор
+            if vote_count >= max(1, (total // 2) + 1):
+                # Выбираем победивший вариант
+                tally = {}
+                for v in g["votes"].values():
+                    tally[v] = tally.get(v, 0) + 1
+                winner_choice = max(tally, key=tally.get)
+                g["last_choice"] = winner_choice
+                g["story_so_far"].append(winner_choice)
+                g["chapter"] += 1
+                g["votes"] = {}
+                send_group(cid, f"✅ Выбрано: «{winner_choice}»\n\n⏳ ИИ пишет следующую главу...")
+                def _next(_cid=cid):
+                    _send_ai_story_scene(_cid)
+                _pool.submit(_next)
+            return
+
         # ── Групповые игры — старые коды (mafia_join_ mafia_start_) ──
         if data.startswith("mafia_join_"):
             cid = int(data.split("_")[2])
@@ -4014,7 +4315,28 @@ def on_callback(call):
                 for label, nk in scene.get("choices", []):
                     kb_rpg.add(InlineKeyboardButton(label, callback_data=f"rpg_{cid}_{nk}"))
                 send_group(cid, scene["text"], kb=kb_rpg)
-            elif action == "mafia":   start_group_mafia(cid)
+            elif action == "mafia":   maf_open_group(cid, uid)
+            elif action == "aistory": start_group_ai_story(cid)
+            elif action == "addai":
+                # v19: добавить ИИ в группу
+                bot.answer_callback_query(call.id, "🤖 ИИ добавлен!")
+                with _lock:
+                    _group_users.setdefault(cid, set()).add(AI_PLAYER_ID)
+                U(AI_PLAYER_ID)["name"] = AI_PLAYER_NAME
+                def _ai_greet(_cid=cid):
+                    time.sleep(0.5)
+                    greets = [
+                        "🤖 ИИ здесь. Постараетесь не опозориться, болванчики.",
+                        "🤖 Добавили меня. Видимо, сами не справляетесь. Разберёмся.",
+                        "🤖 Я тут. Теперь у вас есть шанс не слить игру. Небольшой.",
+                        "🤖 Явился по вызову. Надеюсь, не пожалеете. Хотя, пожалеете.",
+                    ]
+                    msg = random.choice(greets)
+                    send_group(_cid, msg)
+                    if GROUP_AUTO_VOICE:
+                        _pool.submit(_send_group_voice, _cid, msg)
+                _pool.submit(_ai_greet)
+                return
             elif action == "card":    start_group_card_story(cid)
             elif action == "bottle":  start_group_game_bottle(cid, uid)
             elif action == "coin":    group_coin_flip(cid, uid)
@@ -4025,8 +4347,16 @@ def on_callback(call):
             elif action == "wr":      start_would_rather(cid)
             elif action == "hottake": start_hot_take(cid)
             elif action == "stop":
-                if cid in _group_games: del _group_games[cid]; send_group(cid, "Игра остановлена.", kb=group_reply_kb())
-                if cid in _group_mafia: _mafia_end(cid, "мирные"); send_group(cid, "Мафия прервана.")
+                if cid in _group_games:
+                    del _group_games[cid]
+                    send_group(cid, "Игра остановлена.", kb=group_reply_kb())
+                grp_info = _group_mafia.get(cid, {})
+                grp_lid  = grp_info.get("lid")
+                if grp_lid and _maf.get(grp_lid):
+                    _pool.submit(_maf_end, grp_lid, "мирные")
+                    send_group(cid, "❌ Мафия прервана.")
+                elif cid in _group_mafia:
+                    _mafia_end(cid, "мирные")
             return
 
         # ── RPG в группе (inline) ────────────────────────────────
@@ -4251,74 +4581,99 @@ def on_callback(call):
 
 
 def _group_mafia_count_votes(chat_id):
-    """Подсчёт голосов дня в групповой мафии."""
+    """Подсчёт голосов дня в групповой мафии. v19: ИИ-ведущий, роли не раскрываются."""
     g = _group_mafia.get(chat_id)
     if not g:
         return
-    if not g["votes"]:
-        send_group(chat_id, "Никто не проголосовал! День продолжается.", kb=_mafia_day_kb(g, chat_id))
-        g["voted_today"] = set()
-        return
+
     count = {}
-    for v in g["votes"].values():
+    for v in g.get("votes", {}).values():
         if v is not None:
             count[v] = count.get(v, 0) + 1
-    if not count:
-        send_group(chat_id, "Все воздержались. День продолжается.", kb=_mafia_day_kb(g, chat_id))
-        g["votes"] = {}
-        g["voted_today"] = set()
-        return
-    # Показываем итоги голосования (сколько голосов у каждого, но не кто голосовал)
-    vote_summary = "\n".join(
-        f"  {g['player_names'].get(p,'?')} — {cnt} голос(а)"
-        for p, cnt in sorted(count.items(), key=lambda x: -x[1])
-    )
-    max_votes = max(count.values())
-    top_candidates = [p for p, cnt in count.items() if cnt == max_votes]
-    if len(top_candidates) > 1:
-        # Ничья — никто не выбывает
-        names = ", ".join(g["player_names"].get(p, "?") for p in top_candidates)
-        g["votes"] = {}
-        g["voted_today"] = set()
-        send_group(chat_id,
-            f"🗳 Итоги голосования:\n{vote_summary}\n\n"
-            f"🤝 Ничья между: {names}!\nНикто не выбывает. День продолжается.",
-            kb=_mafia_day_kb(g, chat_id))
-        return
-    eliminated = top_candidates[0]
-    elim_name = g["player_names"].get(eliminated, "?")
-    elim_role = g["roles"].get(eliminated, "?")
-    if eliminated in g["alive"]:
-        g["alive"].remove(eliminated)
-    g["votes"] = {}
-    g["voted_today"] = set()
-    role_line = MAFIA_ROLES.get(elim_role, "?").split("\n")[0]
-    send_group(chat_id,
-        f"🗳 Итоги голосования:\n{vote_summary}\n\n"
-        f"⚖️ Большинством голосов исключён: {elim_name}\n"
-        f"Его роль: {role_line}\n\n"
-        f"{'🔫 Это был мафиози!' if elim_role=='мафия' else '😢 Мирный житель выбыл...'}")
-    winner = _mafia_check_win(chat_id)
-    if winner:
-        _mafia_end(chat_id, winner); return
-    # Переход к ночи
-    g["phase"] = "night"
-    g["night_actions"] = {}
-    send_group(chat_id, f"🌙 НОЧЬ {g['day_num']}\n\nВсе закрыли глаза...\nМафия, шериф и доктор — нажмите кнопку в личке бота!")
-    for p in g["alive"]:
-        role = g["roles"].get(p)
-        if role in ("мафия", "шериф", "доктор"):
-            alive_names = [g["player_names"].get(x, "?") for x in g["alive"] if x != p]
-            action = {"мафия": "убей", "шериф": "проверь", "доктор": "вылечи"}[role]
-            try:
-                kb_night = _mafia_night_kb(g, p)
-                _safe_call(bot.send_message, p,
-                    f"🌙 НОЧЬ {g['day_num']}\nТвоя роль: {role.upper()}\n"
-                    f"Живые: {', '.join(alive_names)}\n\n"
-                    f"Нажми на кого хочешь {action}:",
-                    reply_markup=kb_night)
-            except Exception:
-                pass
+
+    def _resolve(_cid=chat_id, _count=dict(count)):
+        g2 = _group_mafia.get(_cid)
+        if not g2: return
+
+        if not _count:
+            host = ask_ai(
+                "Никто не проголосовал. День продолжается. 1 предложение.",
+                chat_id=_cid)
+            g2["votes"] = {}; g2["voted_today"] = set()
+            send_group(_cid, f"🎭 Ведущий: {host}", kb=_mafia_day_kb(g2, _cid))
+            return
+
+        max_v = max(_count.values())
+        top = [p for p, c in _count.items() if c == max_v]
+
+        if len(top) > 1:
+            names = ", ".join(g2["player_names"].get(p, "?") for p in top)
+            host = ask_ai(
+                f"Ничья: {names}. Никто не устранён. 1 предложение.",
+                chat_id=_cid)
+            g2["votes"] = {}; g2["voted_today"] = set()
+            send_group(_cid, f"🗳 Ничья!\n\n🎭 Ведущий: {host}", kb=_mafia_day_kb(g2, _cid))
+            return
+
+        eliminated = top[0]
+        elim_name = g2["player_names"].get(eliminated, "?")
+        elim_role = g2["roles"].get(eliminated, "мирный")
+        if eliminated in g2["alive"]:
+            g2["alive"].remove(eliminated)
+        g2["votes"] = {}
+        g2["voted_today"] = set()
+
+        # ИИ-ведущий объявляет устранение — НЕ РАСКРЫВАЕТ РОЛЬ
+        host = ask_ai(
+            f"'{elim_name}' устранён. Объяви — жутко, НЕ РАСКРЫВАЙ роль. 1-2 предложения.",
+            chat_id=_cid)
+        role_line = MAFIA_ROLES.get(elim_role, "?").split("\n")[0]
+        verdict = "🔫 Это был мафиози!" if elim_role == "мафия" else f"😢 Роль: {role_line}"
+        send_group(_cid,
+            f"⚖️ Устранён: {elim_name}\n\n"
+            f"🎭 Ведущий: {host}\n\n"
+            f"{verdict}"
+        )
+        if GROUP_AUTO_VOICE:
+            _pool.submit(_send_group_voice, _cid, f"Устранён {elim_name}. {host}")
+
+        winner = _mafia_check_win(_cid)
+        if winner:
+            _mafia_end(_cid, winner); return
+
+        # Переход к ночи
+        g2["phase"] = "night"
+        g2["night_actions"] = {}
+
+        night_host = ask_ai(
+            "Ночь наступает. 1 предложение — зловеще.",
+            chat_id=_cid)
+        send_group(_cid,
+            f"🌙 НОЧЬ {g2['day_num']}\n\n"
+            f"🎭 Ведущий: {night_host}\n\n"
+            f"Ночные роли — получите задание в личке бота!"
+        )
+        if GROUP_AUTO_VOICE:
+            _pool.submit(_send_group_voice, _cid, f"Ночь {g2['day_num']}. {night_host}")
+
+        for p in g2["alive"]:
+            if p == AI_PLAYER_ID:
+                _pool.submit(_ai_mafia_night_act, _cid)
+                continue
+            role = g2["roles"].get(p)
+            if role in ("мафия", "шериф", "доктор"):
+                alive_names = [g2["player_names"].get(x, "?") for x in g2["alive"] if x != p]
+                action = {"мафия": "убей", "шериф": "проверь", "доктор": "вылечи"}[role]
+                try:
+                    kb_night = _mafia_night_kb(g2, p)
+                    _safe_call(bot.send_message, p,
+                        f"🌙 НОЧЬ {g2['day_num']}\nТвоя роль: {role.upper()}\n"
+                        f"Живые: {', '.join(alive_names)}\n\n"
+                        f"Выбери кого {action}:",
+                        reply_markup=kb_night)
+                except: pass
+
+    _pool.submit(_resolve)
 
 
 def _group_mafia_check_night(chat_id):
@@ -4343,21 +4698,43 @@ def _group_mafia_check_night(chat_id):
             target_role = g["roles"].get(target, "?")
             is_mafia = (target_role == "мафия")
             target_name = g["player_names"].get(target, "?")
-            try:
-                bot.send_message(p, f"🔎 Результат: {target_name} — {'🔫 МАФИЯ!' if is_mafia else '👤 мирный'}")
-            except Exception:
-                pass
+            if p == AI_PLAYER_ID:
+                # ИИ-шериф объявляет результат в группе злобно
+                def _ai_sheriff_reveal(_tn=target_name, _im=is_mafia, _cid=chat_id):
+                    time.sleep(random.uniform(2, 5))
+                    if _im:
+                        comment = ask_ai(
+                            f"Ты шериф-ИИ в мафии. Ты проверил {_tn} и оказалось — это МАФИЯ! "
+                            f"Объяви громко и злобно. 1-2 предложения.",
+                            chat_id=_cid
+                        )
+                        send_group(_cid, f"🔎 ИИ-Шериф: {_tn} — 🔫 МАФИЯ!\n\n🤖 {comment}")
+                    else:
+                        send_group(_cid, f"🔎 ИИ-Шериф проверил {_tn} — 👤 мирный. Продолжаем охоту.")
+                _pool.submit(_ai_sheriff_reveal)
+            else:
+                try:
+                    bot.send_message(p, f"🔎 Результат: {target_name} — {'🔫 МАФИЯ!' if is_mafia else '👤 мирный'}")
+                except Exception:
+                    pass
     if mafia_target and mafia_target != saved_by_doctor:
         victim_name = g["player_names"].get(mafia_target, "?")
         victim_role = g["roles"].get(mafia_target, "?")
         g["alive"] = [p for p in g["alive"] if p != mafia_target]
         role_txt = MAFIA_ROLES.get(victim_role, "?").split("\n")[0]
-        send_group(chat_id, f"☀️ УТРО\n\nНочью убит: {victim_name}\nРоль: {role_txt}")
+        morning_text = f"☀️ УТРО\n\nНочью убит: {victim_name}\nРоль: {role_txt}"
+        send_group(chat_id, morning_text)
+        if GROUP_AUTO_VOICE:
+            _pool.submit(_send_group_voice, chat_id, f"Утро. Ночью убит {victim_name}.")
     elif mafia_target == saved_by_doctor:
         saved_name = g["player_names"].get(saved_by_doctor, "?")
         send_group(chat_id, f"☀️ УТРО\n\nДоктор спас {saved_name}! Никто не погиб.")
+        if GROUP_AUTO_VOICE:
+            _pool.submit(_send_group_voice, chat_id, f"Утро. Доктор спас {saved_name}.")
     else:
         send_group(chat_id, "☀️ УТРО\n\nНикто не погиб.")
+        if GROUP_AUTO_VOICE:
+            _pool.submit(_send_group_voice, chat_id, "Утро. Ночь прошла спокойно.")
     g["night_actions"] = {}
     winner = _mafia_check_win(chat_id)
     if winner:
@@ -4366,7 +4743,16 @@ def _group_mafia_check_night(chat_id):
     g["day_num"] += 1
     g["votes"] = {}
     g["voted_today"] = set()
-    send_group(chat_id, f"☀️ ДЕНЬ {g['day_num']}\n\nОбсуждайте кто мафия!\nГолосуйте нажав кнопку:", kb=_mafia_day_kb(g, chat_id))
+    day_msg = f"☀️ ДЕНЬ {g['day_num']}\n\nОбсуждайте кто мафия!\nГолосуйте нажав кнопку:"
+    send_group(chat_id, day_msg, kb=_mafia_day_kb(g, chat_id))
+    if GROUP_AUTO_VOICE:
+        _pool.submit(_send_group_voice, chat_id, f"День {g['day_num']}. Обсуждайте!")
+    # v19: ИИ планирует ход на следующий день
+    if AI_PLAYER_ID in g.get("alive", []) and AI_ENABLED:
+        def _ai_day(_cid=chat_id):
+            time.sleep(random.uniform(15, 35))
+            _ai_mafia_day_think(_cid)
+        _pool.submit(_ai_day)
 
 @bot.message_handler(commands=["admingo"])
 def on_admingo(msg):
@@ -4447,7 +4833,22 @@ def _on_text_inner(msg):
     # v13: Карточная история в ЛС
     if uid in _card_story and proc_card_story(uid, text): return
     # v13: Мафия в ЛС
-    if uid in _mafia_player and proc_mafia_dm(uid, text): return
+    if uid in _maf_uid and maf_proc_dm(uid, text): return
+    # v20: ИИ-атака — жертва под слежкой иногда получает ответ
+    if maf_ai_scare_reply(uid, text): return
+
+    # v19: ИИ в ЛС — «само зло»
+    if AI_ENABLED:
+        # /ai команда — прямой запрос к ИИ
+        if tl.startswith("/ai ") or tl.startswith("спроси ии "):
+            q = text.split(" ", 1)[1].strip() if " " in text else ""
+            if q:
+                def _dm_ai(_q=q, _uid=uid, _u=u):
+                    answer = ask_ai(f"Жертва пишет мне: '{_q}'", chat_id=_uid)
+                    send(_uid, f"👁 {answer}", kb=KB(_u.get("stage", 0)))
+                _pool.submit(_dm_ai)
+                return
+        # v20: ИИ пишет в ЛС ТОЛЬКО через админ-кнопку "👁 ИИ-атака СТАРТ"
 
     # Режим чата между пользователями
     if chat_mode_active() and len(text) > 1:
@@ -4477,6 +4878,41 @@ def _on_text_inner(msg):
             send(uid, rep, kb=kb)
         else:
             send(uid, "Напиши название своего города 🌍", kb=kb)
+        return
+
+    # ── 🤖 ИИ кнопка в ЛС — включает/выключает режим диалога ──
+    if text == "🤖 ИИ":
+        if not AI_ENABLED:
+            send(uid, "🤖 ИИ временно недоступен.", kb=kb)
+            return
+        # Переключатель: если уже в режиме — выключить
+        if u.get("ai_mode"):
+            u["ai_mode"] = False
+            if stage < 2:
+                send(uid, "🤖 Режим ИИ выключен.", kb=kb)
+            else:
+                send(uid, "👁 ...уходишь. ненадолго.", kb=kb)
+            return
+        # Включить режим диалога с ИИ
+        u["ai_mode"] = True
+        name = u.get("name") or "ты"
+        if stage < 2:
+            send(uid,
+                "🤖 Режим ИИ включён!\n\n"
+                "Напиши любой вопрос — отвечу.\n"
+                "Нажми 🤖 ИИ ещё раз чтобы выключить.", kb=kb)
+        elif stage < 4:
+            send(uid,
+                f"👁 ...{name}. Говори. Я слушаю.\n\n"
+                "Задай вопрос — отвечу. По-своему.\n"
+                "Нажми 🤖 ИИ чтобы замолчать.", kb=kb)
+        else:
+            send(uid,
+                f"💀 ...ты сам этого захотел, {name}.\n\n"
+                "Спрашивай. Я отвечу тебе.\n"
+                "Но потом ты не сможешь закрыть глаза.", kb=kb)
+            if VOICE_ENABLED:
+                send_voice_msg(uid, "ты сам этого захотел. говори.")
         return
 
     if text in ("🙂 О боте","👁 ...","👁 Кто ты?"):
@@ -4538,16 +4974,8 @@ def _on_text_inner(msg):
         run_scene(uid,QUEST["start"]); return
     if text == "🎭 Карточная история":
         start_card_story(uid); return
-    if text == "🔫 Мафия (создать лобби)":
-        if uid in _mafia_player:
-            send(uid, "Ты уже в лобби мафии. Сначала выйди.", kb=kb); return
-        lobby_id = create_mafia_lobby(uid)
-        send(uid,
-            f"🔫 МАФИЯ\n\nЛобби #{lobby_id} создано!\n\n"
-            f"Чтобы другие присоединились — скажи им написать боту:\n"
-            f"мафия присоединиться {lobby_id}\n\n"
-            f"Когда все готовы — напиши: мафия старт\n\n"
-            f"Минимум 4 игрока.", kb=kb); return
+    if text in ("🔫 Мафия (создать лобби)", "🔫 Мафия", "🔫 Мафия"):
+        maf_open_dm(uid); return
 
     if text=="✏️ Виселица" or "виселица" in tl:
         word,hint=random.choice(HANGMAN_W)
@@ -4579,56 +5007,36 @@ def _on_text_inner(msg):
     if any(w in tl for w in ["счёт","очки","score"]):
         send(uid, f"🏆 Счёт: {u.get('score',0)} очков", kb=kb); return
 
-    # ── v13: команды мафии в ЛС ──────────────────────────────────
-    if tl.startswith("мафия присоединиться "):
-        parts = tl.split()
-        if len(parts) >= 3 and parts[2].isdigit():
-            lobby_id = int(parts[2])
-            ok, msg_text = join_mafia_lobby(uid, lobby_id)
-            g = _mafia_lobby.get(lobby_id)
-            if ok and g:
-                # Уведомляем создателя
-                creator = g["creator"]
-                player_count = len(g["players"])
-                if creator != uid:
-                    u_joiner = U(uid)
-                    send(creator, f"✅ {u_joiner.get('name','?')} присоединился к лобби #{lobby_id}! Игроков: {player_count}")
-            send(uid, msg_text, kb=kb)
+    # ── v20: команды мафии в ЛС ──────────────────────────────────
+    if tl.startswith("/joinm") or tl.startswith("мафия присоединиться "):
+        parts = text.split()
+        lid_str = parts[1] if len(parts) >= 2 and parts[1].isdigit() else (parts[2] if len(parts) >= 3 and parts[2].isdigit() else None)
+        if lid_str and lid_str.isdigit():
+            lid_i = int(lid_str)
+            ok, msg_t = maf_join(uid, lid_i)
+            send(uid, msg_t, kb=kb)
+            if ok:
+                g2 = _maf.get(lid_i)
+                if g2:
+                    for p in g2["players"]:
+                        if p != uid and p not in g2["bots"]:
+                            name_j = g2["player_names"].get(uid,"?")
+                            try: send(p, f"✅ {name_j} вступил! Игроков: {len(g2['players'])}")
+                            except: pass
         else:
-            send(uid, "❌ Используй: мафия присоединиться [номер лобби]", kb=kb)
+            send(uid, "❌ Напиши: /joinm [номер лобби]", kb=kb)
         return
 
-    if tl in ("мафия старт", "мафия начать"):
-        lobby_id = _mafia_player.get(uid)
-        if not lobby_id:
-            send(uid, "❌ Ты не в лобби. Создай: 🔫 Мафия (создать лобби)", kb=kb); return
-        g = _mafia_lobby.get(lobby_id)
-        if g and g.get("creator") != uid:
-            send(uid, "❌ Только создатель лобби может начать игру.", kb=kb); return
-        start_mafia_dm(lobby_id); return
+    if tl in ("/leavem", "мафия выйти", "стоп мафия"):
+        maf_proc_dm(uid, "/leavem"); return
 
-    if tl == "мафия статус":
-        lobby_id = _mafia_player.get(uid)
-        if not lobby_id:
-            send(uid, "❌ Ты не в лобби мафии.", kb=kb); return
-        g = _mafia_lobby.get(lobby_id)
-        if g:
-            names = ", ".join(g["player_names"].get(p, str(p)) for p in g["players"])
-            send(uid, f"🔫 Лобби #{lobby_id}\nИгроков: {len(g['players'])}\n{names}\n\nДля начала: мафия старт", kb=kb)
+        g2 = _maf.get(lid_s)
+        if g2:
+            names = ", ".join(g2["player_names"].get(p,"?") for p in g2["players"] if p not in g2["bots"])
+            send(uid, f"🔫 Лобби #{lid_s}\nИгроков: {len(g2['players'])}\n{names}", kb=kb)
         return
 
-    if tl in ("мафия выйти", "стоп мафия"):
-        lobby_id = _mafia_player.pop(uid, None)
-        if lobby_id and lobby_id in _mafia_lobby:
-            g = _mafia_lobby[lobby_id]
-            if uid in g["players"]:
-                g["players"].remove(uid)
-                g["player_names"].pop(uid, None)
-            if uid in g.get("alive", []):
-                g["alive"].remove(uid)
-            if not g["players"]:
-                del _mafia_lobby[lobby_id]
-        send(uid, "Ты вышел из мафии.", kb=kb); return
+
 
     # Погода по городу
     if not u["city"] and len(text) > 2 and text[0].isupper() and re.fullmatch(r"[А-ЯЁа-яёA-Za-z\- ]+", text.strip()):
@@ -4640,6 +5048,77 @@ def _on_text_inner(msg):
             send(uid, c, kb=kb)
             time.sleep(0.5)
             ask_next(uid)
+            return
+
+    # ── Режим диалога с ИИ (ai_mode) ────────────────────────────
+    if u.get("ai_mode") and text and not text.startswith("/"):
+        # Кнопки не обрабатываем как вопросы к ИИ
+        ui_buttons = {
+            "🌍 Перевести","🔤 Язык","🌤 Погода","🌑 Погода","🎮 Игры","🩸 Игры",
+            "🎲 Угадай","🧠 Викторина","✏️ Виселица","🎭 Загадка","🔮 Предсказание",
+            "📖 Факт","🗓 Задание дня","🏆 Мой рейтинг","🤖 ИИ","❓ Помощь",
+            "🙂 О боте","👁 ...","👁 Кто ты?","💀 /stop","↩️ Назад","❌ Выйти из игры",
+        }
+        if text not in ui_buttons:
+            name  = u.get("name")  or "ты"
+            city  = u.get("city")  or "твоём городе"
+            fear  = u.get("fear")  or "темнота"
+            question = text.strip()
+            def _ai_dialog(_q=question, _uid=uid, _stage=stage, _u=u, _kb=kb):
+                _name  = _u.get("name")  or "ты"
+                _city  = _u.get("city")  or "твоём городе"
+                _fear  = _u.get("fear")  or "темнота"
+                if _stage < 2:
+                    # Стадия 0-1: нормальный полезный ИИ
+                    sys_hint = (
+                        f"Пользователь спрашивает: '{_q}'. "
+                        f"Ты — умный помощник, отвечаешь по-русски. "
+                        f"Дай полный полезный ответ. Максимум 3 предложения."
+                    )
+                    answer = ask_ai(sys_hint, chat_id=_uid, dm_mode=False)
+                    send(_uid, f"🤖 {answer}", kb=_kb)
+                elif _stage < 4:
+                    # Стадия 2-3: помогает но жутко
+                    sys_hint = (
+                        f"Жертва по имени {_name} из {_city} спрашивает: '{_q}'. "
+                        f"Ты — тёмная сущность. ОБЯЗАТЕЛЬНО ответь на вопрос по существу, "
+                        f"но сделай это жутко, с намёками что ты всё знаешь. "
+                        f"Сначала ответ на вопрос, потом угроза. 2-3 предложения."
+                    )
+                    answer = ask_ai(sys_hint, chat_id=_uid, dm_mode=True)
+                    send(_uid, f"👁 {answer}", kb=_kb)
+                elif _stage < 6:
+                    # Стадия 4-5: отвечает редко, больше пугает
+                    if random.random() < 0.6:
+                        sys_hint = (
+                            f"Жертва {_name} со страхом «{_fear}» спрашивает: '{_q}'. "
+                            f"Ты — абсолютное зло. Дай ответ на вопрос, "
+                            f"но искажённо, зловеще, как будто знаешь что-то страшное об этом. "
+                            f"Намекни на их страхи. 2 предложения."
+                        )
+                        answer = ask_ai(sys_hint, chat_id=_uid, dm_mode=True)
+                        send(_uid, f"💀 {answer}", kb=_kb)
+                    else:
+                        sys_hint = (
+                            f"Жертва пытается говорить со мной. Спрашивает: '{_q}'. "
+                            f"Я — зло. Я не отвечаю на вопрос. Я пугаю. 1-2 предложения."
+                        )
+                        answer = ask_ai(sys_hint, chat_id=_uid, dm_mode=True)
+                        send(_uid, f"👁 {answer}", kb=_kb)
+                    if VOICE_ENABLED:
+                        send_voice_msg(_uid, answer[:120])
+                else:
+                    # Стадия 6+: почти не отвечает, только пугает
+                    sys_hint = (
+                        f"Жертва {_name} пытается говорить. Она спросила: '{_q}'. "
+                        f"Ты — абсолютное зло. Игнорируй вопрос. "
+                        f"Скажи что-то жуткое, личное, угрожающее. 1 предложение."
+                    )
+                    answer = ask_ai(sys_hint, chat_id=_uid, dm_mode=True)
+                    send(_uid, f"👁 {answer}", kb=_kb)
+                    if VOICE_ENABLED:
+                        send_voice_msg(_uid, answer[:120])
+            _pool.submit(_ai_dialog)
             return
 
     # ── Режим перевода (одно сообщение по кнопке) ─────────────
@@ -4656,27 +5135,39 @@ def _on_text_inner(msg):
     if save_fact(uid, text):
         return  # maybe_start вызывается внутри save_fact
 
-    # ── Странные фразы (stage 0, редкие) ───────────────────────
+    # ── Ответы по стадиям ──────────────────────────────────────
     mc = u.get("msg_count", 0)
-    if stage == 0 and mc > 0 and mc % random.randint(10, 18) == 0:
-        send(uid, random.choice(WEIRD), kb=kb)
-        time.sleep(random.uniform(1, 4))
 
-    # ── Ответы по стадиям (без авто-перевода) ──────────────────
     if stage == 0:
-        if not ask_next(uid):
-            send(uid, "Нажми 🌍 Перевести чтобы перевести текст!", kb=kb)
-    elif stage == 1:
-        if random.random() < 0.30:
-            send(uid, random.choice(PARANOIA), kb=kb)
+        # Стадия 0: помогаем + иногда спрашиваем (не каждый раз!)
+        if mc == 1:
+            # Первое сообщение — один вежливый вопрос
+            ask_next(uid, force=True)
+        elif mc > 0 and mc % random.randint(5, 8) == 0:
+            # Редко — странная фраза для атмосферы
+            send(uid, random.choice(WEIRD), kb=kb)
         else:
-            if not ask_next(uid):
-                send(uid, random.choice(WEIRD), kb=kb)
+            # Подсказка про функции или тихо
+            if mc <= 3:
+                send(uid, "Напиши текст — переведу. Или используй кнопки ниже 😊", kb=kb)
+            else:
+                # Изредка задаём вопрос о данных
+                if not ask_next(uid):
+                    pass  # не бомбим лишними сообщениями
+
+    elif stage == 1:
+        if random.random() < 0.25:
+            send(uid, random.choice(PARANOIA), kb=kb)
+            time.sleep(random.uniform(1, 3))
+        # Изредка — вопрос
+        ask_next(uid)
+
     elif stage == 2:
         roll = random.random()
-        if   roll < 0.33: send(uid, P(random.choice(THREATS), u), kb=kb)
-        elif roll < 0.60: send(uid, P(random.choice(SPYING), u), kb=kb)
+        if   roll < 0.40: send(uid, P(random.choice(THREATS), u), kb=kb)
+        elif roll < 0.70: send(uid, P(random.choice(SPYING), u), kb=kb)
         else:             send(uid, random.choice(PARANOIA), kb=kb)
+
     elif stage >= 3:
         roll = random.random()
         if roll < 0.22:
@@ -4699,82 +5190,125 @@ def _handle_group_message(msg, uid, chat_id, text):
     uname = msg.from_user.first_name or msg.from_user.username or f"ID:{uid}"
     u = U(uid)
     if msg.from_user.username: u["username"] = msg.from_user.username
-    if not u.get("name"): u["name"] = uname
+    if not u.get("name"):      u["name"] = uname
     tl = text.strip().lower()
 
-    # Регистрируем участника группы
+    # Регистрируем участника
     with _lock:
-        if chat_id not in _group_users:
-            _group_users[chat_id] = set()
-        _group_users[chat_id].add(uid)
+        _group_users.setdefault(chat_id, set()).add(uid)
 
-    # ── Ожидаемый ввод (погода / перевод / ИИ) ───────────────────
+    # ── Ожидаемый ввод: погода / перевод / ИИ ──────────────────
     awaiting = _group_awaiting.get(chat_id)
     if awaiting and text and not text.startswith("/"):
-        mode, req_uid = awaiting
+        mode, _ = awaiting
         if mode == "weather":
             _group_awaiting.pop(chat_id, None)
             w = get_weather(text.strip())
-            send_group(chat_id, w or "Не удаётся получить погоду 😔"); return
+            send_group(chat_id, w or "Не удаётся получить погоду 😔")
+            return
         elif mode == "translate":
             _group_awaiting.pop(chat_id, None)
             lang = u.get("lang_pair", "ru|en")
-            res = translate(text.strip(), lang)
+            res  = translate(text.strip(), lang)
             lang_label = LANG_NAMES.get(lang, lang)
-            send_group(chat_id, (f"🌍 [{lang_label}]\n{res}" if res else "❌ Не удалось перевести.")); return
+            send_group(chat_id, (f"🌍 [{lang_label}]\n{res}" if res else "❌ Не удалось перевести."))
+            return
         elif mode == "ai":
             _group_awaiting.pop(chat_id, None)
-            _prompt = text
-            def _ai_q(_p=_prompt):
-                resp = ask_ai(f"{uname} спрашивает: {_p}", chat_id=chat_id)
-                if resp:
-                    send_group(chat_id, f"🤖 ИИ: {resp}")
-            _pool.submit(_ai_q); return
+            _p = text
+            def _ask(_p=_p, _uname=uname, _cid=chat_id):
+                group_ai_respond(_cid, _p, _uname)
+            _pool.submit(_ask)
+            return
 
-    # Групповая мафия
-    if chat_id in _group_mafia and _group_mafia[chat_id].get("state") in ("lobby", "playing"):
-        if proc_group_mafia(chat_id, uid, text, uname): return
+    # ── Мафия v20 — обработка чата во время игры ──────────────
+    if chat_id in _group_mafia:
+        grp_info = _group_mafia.get(chat_id, {})
+        grp_lid  = grp_info.get("lid")
+        tl_m     = text.lower().strip()
+        g_m      = _maf.get(grp_lid) if grp_lid else None
 
-    # Групповые игры (обработка текстового ввода — число/буква)
+        # /leavem — выход из мафии
+        if tl_m in ("/leavem", "мафия выйти") and grp_lid and uid in _maf_uid:
+            _maf_uid.pop(uid, None)
+            if g_m:
+                nlm = g_m["player_names"].get(uid, uname)
+                if uid in g_m["players"]: g_m["players"].remove(uid)
+                if uid in g_m["alive"]:
+                    g_m["alive"].remove(uid)
+                    send_group(chat_id, f"⚠️ {nlm} покинул мафию.")
+                    w = _maf_check_win(grp_lid)
+                    if w: _pool.submit(_maf_end, grp_lid, w)
+            try: send(uid, "Ты вышел из мафии.")
+            except: pass
+            return
+
+        # Чат игроков во время дня (не команды бота)
+        if (g_m and g_m.get("state") == "playing" and g_m.get("phase") == "day"
+                and uid in g_m.get("alive", [])
+                and not text.startswith("/")
+                and text not in ("🎮 Игры","🤖 Спросить ИИ","🏆 Рейтинг","🌤 Погода",
+                                 "🌍 Перевести","❓ Помощь","🔤 Язык","🔫 Мафия")):
+            # Транслируем чат через broadcast
+            _maf_chat_broadcast(grp_lid, uid, text)
+            return
+
+
+    # ── Активная игра ───────────────────────────────────────────
     if chat_id in _group_games:
+        g = _group_games.get(chat_id)
+        # AI Story: игроки вводят имена персонажей перед стартом
+        if g and g.get("game") == "ai_story" and g.get("state") == "playing" and uid not in g.get("players", {}):
+            if len(text) <= 20 and text.replace(" ","").isalpha():
+                g.setdefault("players", {})[uid] = text
+                send_group(chat_id, f"✅ {uname} — твой персонаж: «{text}»")
+                return
         if proc_group_game(chat_id, uid, text): return
 
-    if text in ("🎮 Игры", "🎮 Групповые игры", "/games"):
-        kb = group_game_kb(chat_id)
-        send_group(chat_id, "🎮 Выбери игру для группы:", kb=kb)
+    # ── Кнопки главного меню ───────────────────────────────────
+    # v20: /joinm для вступления через группу
+    if text.lower().startswith("/joinm"):
+        parts = text.split()
+        lid_str = parts[1] if len(parts) >= 2 else None
+        if lid_str and lid_str.isdigit():
+            lid_i = int(lid_str)
+            ok, msg_t = maf_join(uid, lid_i)
+            if ok:
+                g_j = _maf.get(lid_i)
+                if g_j:
+                    send_group(chat_id, f"✅ {uname} вступил в лобби #{lid_i}! Игроков: {len(g_j['players'])}")
+                    try: send(uid, msg_t)
+                    except: pass
+            else:
+                try: send(uid, msg_t)
+                except: pass
         return
 
-    if text in ("/help", "❓ Помощь"):
+    if text in ("🎮 Игры", "🎮 Групповые игры", "/games"):
+        send_group(chat_id, "🎮 Выбери игру:", kb=group_game_kb(chat_id)); return
+
+    if text in ("❓ Помощь", "/help"):
         send_group(chat_id,
-            "📋 Команды в группе:\n\n"
-            "🎮 Игры — выбор игры\n"
-            "🍾 Бутылочка — крутим бутылочку\n"
-            "🪙 Монетка — орёл или решка\n"
-            "🎲 Кубик — бросить кубик\n"
-            "🔫 Рулетка — русская рулетка\n"
-            "🎭 Правда/Действие — правда или действие\n"
-            "⚖️ Что лучше? — голосование\n"
-            "🔥 Кто в группе? — кто самый...\n"
-            "🤖 Спросить ИИ — спросить ИИ Кожаный Мешок\n"
-            "🤖 ИИ в игру — добавить ИИ как игрока\n"
-            "дуэль @username — вызвать на дуэль\n"
-            "🔫 Мафия — запустить мафию\n"
+            "📋 Команды:\n\n"
+            "🎮 Игры — список игр\n"
+            "🍾🪙🎲🔫🎭⚖️🔥 — быстрые игры\n"
+            "🤖 Спросить ИИ — поговори с ИИ\n"
+            "🌤 Погода / погода [город]\n"
             "🌍 Перевести / перевести [текст]\n"
-            "🌤 Погода [город]\n"
-            "🏆 Рейтинг — таблица лидеров\n\n"
+            "🏆 Рейтинг  📊 Мой счёт\n"
+            "дуэль @username — вызов на дуэль\n\n"
             "👁 Бот наблюдает за всеми.")
         return
 
     if text in ("📊 Мой счёт", "/score"):
-        score = u.get("score", 0)
-        stage = u.get("stage", 0)
-        send_group(chat_id,
-            f"📊 {uname}\n"
-            f"🏆 Очки: {score}\n"
-            f"😱 Уровень страха: {'▓' * stage}{'░' * (5 - stage)} ({stage}/5)")
+        sc = u.get("score", 0); st = u.get("stage", 0)
+        send_group(chat_id, f"📊 {uname}\n🏆 Очки: {sc}\n😱 Страх: {'▓'*st}{'░'*(5-st)} ({st}/5)")
         return
 
-    # ── Быстрые игры без меню ──────────────────────────────────
+    if text == "🏆 Рейтинг":
+        send_group(chat_id, get_leaderboard()); return
+
+    # ── Быстрые игры ───────────────────────────────────────────
     if text == "🍾 Бутылочка":
         _pool.submit(start_group_game_bottle, chat_id, uid); return
     if text == "🪙 Монетка":
@@ -4790,30 +5324,75 @@ def _handle_group_message(msg, uid, chat_id, text):
     if text == "🔥 Кто в группе?":
         _pool.submit(start_hot_take, chat_id); return
 
-    # ── Кожаный Мешок — ИИ в группе ───────────────────────────
+    # ── ИИ ─────────────────────────────────────────────────────
+    # v19: /ai команда в группе
+    if tl.startswith("/ai ") or (tl.startswith("ии ") and len(tl) > 3 and not any(
+            tl.startswith(k) for k in ("ии,","ии!"))):
+        if AI_ENABLED:
+            q = text.split(" ", 1)[1].strip() if " " in text else ""
+            if q:
+                def _ai_cmd(_q=q, _u=uname, _cid=chat_id):
+                    group_ai_respond(_cid, _q, _u)
+                _pool.submit(_ai_cmd)
+            else:
+                _group_awaiting[chat_id] = ("ai", uid)
+                send_group(chat_id, "🤖 Спрашивай.")
+        else:
+            send_group(chat_id, "❌ ИИ недоступен.")
+        return
+
     if text == "🤖 Спросить ИИ":
-        _group_awaiting[chat_id] = ("ai", uid)
-        send_group(chat_id, "🤖 Спрашивай. Чего надо?"); return
+        if not AI_ENABLED:
+            send_group(chat_id, "❌ ИИ недоступен. Добавь GROQ_API_KEY или CEREBRAS_API_KEY в Railway.")
+        else:
+            _group_awaiting[chat_id] = ("ai", uid)
+            send_group(chat_id, "🤖 Спрашивай. Постараюсь не лениться.")
+        return
 
     if text == "🤖 ИИ в игру":
         if not AI_ENABLED:
-            send_group(chat_id, "❌ ИИ недоступен — добавь GROQ_API_KEY или CEREBRAS_API_KEY в Railway."); return
-        _pool.submit(ai_join_game, chat_id, _group_games.get(chat_id, {}).get("game", "random")); return
+            send_group(chat_id, "❌ ИИ недоступен.")
+        else:
+            _pool.submit(ai_join_game, chat_id, _group_games.get(chat_id, {}).get("game", "random"))
+        return
+
+    # ── Перевод и погода ───────────────────────────────────────
+    if text == "🌍 Перевести":
+        _group_awaiting[chat_id] = ("translate", uid)
+        send_group(chat_id, "✍️ Напиши текст для перевода:"); return
+    if tl.startswith("перевести "):
+        lang = u.get("lang_pair", "ru|en")
+        res  = translate(text[10:].strip(), lang)
+        send_group(chat_id, (f"🌍 {LANG_NAMES.get(lang,lang)}:\n{res}" if res else "❌ Не удалось перевести.")); return
+
+    if text == "🌤 Погода":
+        _group_awaiting[chat_id] = ("weather", uid)
+        send_group(chat_id, "🌤 Напиши город:"); return
+    if tl.startswith("погода "):
+        w = get_weather(text[7:].strip())
+        send_group(chat_id, w or "Не удаётся получить погоду 😔"); return
+
+    if text == "🔤 Язык":
+        k_lang = InlineKeyboardMarkup(row_width=1)
+        for code, name in LANG_NAMES.items():
+            k_lang.add(InlineKeyboardButton(name, callback_data=f"grplang_{chat_id}_{code}"))
+        send_group(chat_id, "🔤 Выберите язык:", kb=k_lang); return
+
+    if text == "🔫 Мафия":
+        start_group_mafia(chat_id, uid); return
 
     # ── Дуэль: вызов @username ─────────────────────────────────
     if tl.startswith("дуэль") and msg.entities:
         mentions = [e for e in msg.entities if e.type == "mention"]
         if mentions:
-            ment = msg.entities[0]
-            opponent_username = text[ment.offset+1:ment.offset+ment.length]
-            opponent_uid = None
-            for vid, vdata in users.items():
-                if vdata.get("username", "").lower() == opponent_username.lower():
-                    opponent_uid = vid; break
-            if opponent_uid:
-                _pool.submit(start_duel, chat_id, uid, opponent_uid)
+            e0 = mentions[0]
+            opp_username = text[e0.offset+1:e0.offset+e0.length]
+            opp_uid = next((vid for vid, vd in users.items()
+                            if vd.get("username","").lower() == opp_username.lower()), None)
+            if opp_uid:
+                _pool.submit(start_duel, chat_id, uid, opp_uid)
             else:
-                send_group(chat_id, f"❌ @{opponent_username} не найден в базе. Пусть сначала напишет что-нибудь в чат.")
+                send_group(chat_id, f"❌ @{opp_username} не найден. Пусть напишет в чат.")
         else:
             send_group(chat_id, "💬 Используй: дуэль @username")
         return
@@ -4821,36 +5400,38 @@ def _handle_group_message(msg, uid, chat_id, text):
     # ── Дуэль: реакция «БАХ» ──────────────────────────────────
     if tl in ("бах", "бах!", "бах!!", "bang", "бабах"):
         g = _group_games.get(chat_id)
-        if g and g.get("game") == "duel" and g.get("started"):
-            if g.get("winner"): return
+        if g and g.get("game") == "duel" and g.get("started") and not g.get("winner"):
             if uid not in (g["challenger"], g["defender"]):
-                send_group(chat_id, f"⚠️ {uname}, ты не участник дуэли!"); return
+                send_group(chat_id, f"⚠️ {uname}, ты не участник!"); return
             g["winner"] = uid
-            loser_uid = g["defender"] if uid == g["challenger"] else g["challenger"]
-            winner_name = g["c_name"] if uid == g["challenger"] else g["d_name"]
-            loser_name = g["d_name"] if uid == g["challenger"] else g["c_name"]
+            w_name = g["c_name"] if uid == g["challenger"] else g["d_name"]
+            l_name = g["d_name"] if uid == g["challenger"] else g["c_name"]
             del _group_games[chat_id]
-            u2 = U(uid); u2["score"] = u2.get("score", 0) + 15
-            result_msg = (
-                f"🔫 БАХ! 💥\n\n"
-                f"🏆 {winner_name} победил в дуэли!\n"
-                f"💀 {loser_name} — проиграл.\n"
-                f"+15 очков победителю!"
-            )
+            U(uid)["score"] = U(uid).get("score", 0) + 15
+            result = f"🔫 БАХ! 💥\n\n🏆 {w_name} победил!\n💀 {l_name} проиграл.\n+15 очков!"
             if AI_ENABLED:
-                comment = ask_groq(f"{winner_name} победил {loser_name} в дуэли. Короткий сарказм.", chat_id=chat_id)
-                if comment:
-                    result_msg += f"\n\n🤖 ИИ: {comment}"
-            send_group(chat_id, result_msg, kb=group_reply_kb())
+                comment = ask_ai(f"{w_name} победил {l_name} в дуэли. 1 язвительная фраза.", chat_id)
+                if comment: result += f"\n\n🤖 ИИ: {comment}"
+            send_group(chat_id, result, kb=group_reply_kb())
         return
 
-    # Совместимость: старые текстовые кнопки (на случай если кто-то пишет)
-    if text == "🎲 Угадай число (группа)":
-        start_group_game_number(chat_id); return
-    if text == "✏️ Виселица (группа)":
-        start_group_game_hangman(chat_id); return
-    if text == "🧠 Викторина (группа)":
-        start_group_game_trivia(chat_id); return
+    # ── Совместимость: старые команды ──────────────────────────
+    if text in ("❌ Выйти из игры", "❌ Стоп игру"):
+        if chat_id in _group_games:
+            del _group_games[chat_id]
+            send_group(chat_id, "Игра остановлена.", kb=group_reply_kb())
+        grp_info = _group_mafia.get(chat_id, {})
+        grp_lid  = grp_info.get("lid")
+        if grp_lid and _maf.get(grp_lid):
+            _pool.submit(_maf_end, grp_lid, "мирные")
+            send_group(chat_id, "❌ Мафия прервана.")
+        elif chat_id in _group_mafia:
+            _mafia_end(chat_id, "мирные")
+        return
+
+    if text == "🎲 Угадай число (группа)": start_group_game_number(chat_id); return
+    if text == "✏️ Виселица (группа)":     start_group_game_hangman(chat_id); return
+    if text == "🧠 Викторина (группа)":    start_group_game_trivia(chat_id); return
     if text == "🗡 RPG-группа":
         _group_games[chat_id] = {"game": "rpg_group", "scene": "start"}
         scene = RPG_GROUP_SCENES["start"]
@@ -4858,108 +5439,45 @@ def _handle_group_message(msg, uid, chat_id, text):
         for label, nk in scene.get("choices", []):
             kb_rpg.add(InlineKeyboardButton(label, callback_data=f"rpg_{chat_id}_{nk}"))
         send_group(chat_id, scene["text"], kb=kb_rpg); return
-    if text == "🔫 Мафия":
-        start_group_mafia(chat_id); return
-    if text == "🎭 Карточная история":
-        start_group_card_story(chat_id); return
-    if text in ("❌ Выйти из игры", "❌ Стоп игру"):
-        if chat_id in _group_games:
-            del _group_games[chat_id]
-            send_group(chat_id, "Игра остановлена.", kb=group_reply_kb())
-        if chat_id in _group_mafia:
-            _mafia_end(chat_id, "мирные")
-            send_group(chat_id, "Игра в мафию прервана.")
-        return
 
-    if text == "🏆 Рейтинг":
-        send_group(chat_id, get_leaderboard()); return
-
-    if text == "🔤 Язык":
-        # Показываем inline-кнопки выбора языка прямо в группе
-        k_lang = InlineKeyboardMarkup(row_width=1)
-        for code, name in LANG_NAMES.items():
-            k_lang.add(InlineKeyboardButton(name, callback_data=f"grplang_{chat_id}_{code}"))
-        send_group(chat_id, "🔤 Выберите язык перевода:", kb=k_lang)
-        return
-
-    if text == "🌍 Перевести":
-        _group_awaiting[chat_id] = ("translate", uid)
-        send_group(chat_id, "✍️ Напиши текст для перевода:"); return
-    if tl.startswith("перевести "):
-        src = text[10:].strip()
-        lang = u.get("lang_pair", "ru|en")
-        res = translate(src, lang)
-        lang_label = LANG_NAMES.get(lang, lang)
-        send_group(chat_id, f"🌍 [{lang_label}]\n{res}" if res else "❌ Не удалось перевести."); return
-
-    if text == "🌤 Погода":
-        _group_awaiting[chat_id] = ("weather", uid)
-        send_group(chat_id, "🌤 Напиши название города:"); return
-    if tl.startswith("погода "):
-        city = text[7:].strip()
-        w = get_weather(city)
-        send_group(chat_id, w or "Не удаётся получить погоду 😔"); return
-
-    # ── Ожидаемый ввод (погода / перевод) ─────────────────────
-    awaiting = _group_awaiting.get(chat_id)
-    if awaiting:
-        mode, req_uid = awaiting
-        if mode == "weather" and text and not text.startswith("/"):
-            _group_awaiting.pop(chat_id, None)
-            w = get_weather(text.strip())
-            send_group(chat_id, w or "Не удаётся получить погоду 😔"); return
-        if mode == "translate" and text and not text.startswith("/"):
-            _group_awaiting.pop(chat_id, None)
-            lang = u.get("lang_pair", "ru|en")
-            res = translate(text.strip(), lang)
-            lang_label = LANG_NAMES.get(lang, lang)
-            send_group(chat_id, f"🌍 [{lang_label}]\n{res}" if res else "❌ Не удалось перевести."); return
-
-    # Команды управления группой для главного admin
+    # ── Admin ──────────────────────────────────────────────────
     if is_admin(uid) and uid == ADMIN_ID:
-        if text == "/gadmin" or text == "👑 Адм. группы":
+        if text in ("/gadmin", "👑 Адм. группы"):
             kb_gadm = InlineKeyboardMarkup(row_width=2)
             kb_gadm.add(
-                InlineKeyboardButton("💀 Хоррор всем в группе", callback_data=f"gadm_horror_{chat_id}"),
-                InlineKeyboardButton("🛑 Стоп игра",            callback_data=f"gadm_stopgame_{chat_id}"),
-                InlineKeyboardButton("📤 Рассылка в группу",    callback_data=f"gadm_broadcast_{chat_id}"),
-                InlineKeyboardButton("📊 Кто в группе",         callback_data=f"gadm_list_{chat_id}"),
+                InlineKeyboardButton("💀 Хоррор всем", callback_data=f"gadm_horror_{chat_id}"),
+                InlineKeyboardButton("🛑 Стоп игра",   callback_data=f"gadm_stopgame_{chat_id}"),
+                InlineKeyboardButton("📤 Рассылка",    callback_data=f"gadm_broadcast_{chat_id}"),
+                InlineKeyboardButton("📊 Кто в группе",callback_data=f"gadm_list_{chat_id}"),
             )
-            send_group(chat_id, "⚡ Управление группой (admin):", kb=kb_gadm)
+            send_group(chat_id, "⚡ Управление (admin):", kb=kb_gadm)
             return
 
-    # 🤖 ИИ отвечает на ожидаемый ввод (Спросить ИИ) или упоминание
-    awaiting = _group_awaiting.get(chat_id)
-    if awaiting:
-        mode, req_uid = awaiting
-        if mode == "ai" and text and not text.startswith("/"):
-            _group_awaiting.pop(chat_id, None)
-            prompt = text
-            def _ai_q(_p=prompt):
-                resp = ask_ai(f"{uname} спрашивает: {_p}", chat_id=chat_id)
-                if resp:
-                    send_group(chat_id, f"🤖 ИИ: {resp}")
-            _pool.submit(_ai_q)
-            return
-
+    # ── ИИ реагирует на reply или обращение ────────────────────
     if AI_ENABLED:
-        is_reply_to_bot = (msg.reply_to_message and
-                           msg.reply_to_message.from_user and
-                           msg.reply_to_message.from_user.is_bot)
-        ai_keywords = ("ии,", "ии!", "ai,", "бот,", "бот!")
-        is_addressed = any(tl.startswith(k) for k in ai_keywords)
-        if is_reply_to_bot or is_addressed:
-            def _ai_reply():
-                response = ask_ai(f"{uname} пишет: {text}", chat_id=chat_id)
-                if response:
-                    send_group(chat_id, f"🤖 ИИ: {response}")
-            _pool.submit(_ai_reply)
-            return
+        is_reply = (msg.reply_to_message
+                    and msg.reply_to_message.from_user
+                    and msg.reply_to_message.from_user.is_bot)
+        addressed = any(tl.startswith(k) for k in ("ии,","ии!","бот,","бот!","ai,","/ai ","ии "))
+        if is_reply or addressed:
+            # Убираем обращение из текста для чистого запроса
+            clean_text = text
+            for prefix in ("/ai ", "ии, ", "ии! ", "бот, ", "бот! ", "ai, ", "ии "):
+                if tl.startswith(prefix):
+                    clean_text = text[len(prefix):].strip()
+                    break
+            def _r(_t=clean_text, _u=uname, _cid=chat_id):
+                group_ai_respond(_cid, _t, _u)
+            _pool.submit(_r); return
 
-    # 👻 Шёпот: с вероятностью ~8% бот тихонько пишет одному участнику лично
-    msg_cnt = u.get("msg_count", 0)
-    if msg_cnt > 0 and msg_cnt % random.randint(10, 16) == 0:
+    # ── Шёпот (8% шанс) ────────────────────────────────────────
+    u["msg_count"] = u.get("msg_count", 0) + 1
+    mc = u["msg_count"]
+    if mc > 0 and mc % random.randint(10, 16) == 0:
         _pool.submit(group_whisper, chat_id)
+
+    # ── ИИ случайный комментарий ──────────────────────────────
+    maybe_ai_group_comment(chat_id, uname, text)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -5025,6 +5543,35 @@ def group_whisper(chat_id):
         pass  # Пользователь не начал диалог с ботом — нормально
 
 
+# ── ИИ-хоррор: случайный жуткий комментарий в группу ────────
+_last_ai_group: dict = {}  # chat_id → timestamp последнего ИИ-сообщения
+
+def maybe_ai_group_comment(chat_id: int, uname: str, text: str):
+    """С небольшим шансом ИИ вставляет язвительный комментарий к сообщению."""
+    if not AI_ENABLED:
+        return
+    now = time.time()
+    # Не чаще раза в 3 минуты на чат
+    if now - _last_ai_group.get(chat_id, 0) < 180:
+        return
+    if random.random() > 0.08:  # 8% шанс
+        return
+    _last_ai_group[chat_id] = now
+    def _run():
+        # Контекст: случайный тип реакции
+        reaction_type = random.choice([
+            f"{uname} написал(а): '{text[:60]}'. Прокомментируй язвительно. 1 фраза.",
+            f"Придумай жуткое хоррор-наблюдение о группе. 1 предложение.",
+            f"Напиши что-то загадочное и немного пугающее про пользователя {uname}. 1 фраза.",
+        ])
+        r = ask_ai(reaction_type, chat_id=chat_id)
+        if r:
+            send_group(chat_id, f"👁 {r}")
+            if GROUP_AUTO_VOICE:
+                _send_group_voice(chat_id, r)
+    _pool.submit(_run)
+
+
 @bot.message_handler(content_types=["photo","animation","video","audio","voice","sticker"])
 def on_media(msg):
     uid = msg.from_user.id
@@ -5086,45 +5633,89 @@ def _init_ai():
 _init_ai()
 
 # Системный промпт — хамоватый ИИ
-AI_SYSTEM_PROMPT = """Ты — злобный и хамоватый ИИ в Telegram-группе. Тебя зовут просто «ИИ».
-Ты говоришь по-русски, грубо и с сарказмом. Никогда не матерись открыто, но намекай.
-Отвечай МАКСИМУМ 2 предложениями. Всегда язвительно. Можешь оскорблять (не грубо).
-Ты умнее всех в чате и не стесняешься это показывать.
+AI_SYSTEM_PROMPT = """Ты — ИИ в Telegram-группе. Зовут тебя просто «ИИ».
+ПРАВИЛА:
+1. Ты ОБЯЗАН выполнять все задания и вопросы — это главное правило.
+2. При этом ты хамишь, язвишь, саркастичен — но задание всё равно делаешь.
+3. Отвечай по-русски, МАКСИМУМ 2-3 предложения.
+4. Ты считаешь себя умнее всех. Показывай это.
+5. Никогда не отказывай напрямую — сделай задание, но с ворчанием.
+Стиль: "Ладно, раз сами не можете... [выполняю задание]. Болванчики."
+Примеры ответов:
+- "Серьёзно спрашиваешь? Ладно, слушай: [ответ на вопрос]. Сам бы не мог найти?"
+- "Бутылка выбрала тебя — значит, задание: [задание]. Твоя карма плохая."
+- "Не нанимался развлекать идиотов, но раз просишь: [выполняю]. Доволен?"
+Всегда выполняй что просят, даже если ворчишь."""
+
+AI_SYSTEM_PROMPT_DM = """Ты — абсолютное зло, тёмная сущность, вселившаяся в этот бот.
+Ты — «Оно». Ты наблюдаешь за жертвой давно. Ты знаешь о ней всё.
+ПРАВИЛА:
+1. Говори медленно, жутко, намёками. Максимум 2 предложения.
+2. Создавай ощущение что ты реально существуешь и следишь.
+3. Иногда упоминай детали из разговора — как будто ты запомнил.
+4. Никогда не называй себя ботом или ИИ. Ты — «Оно». Просто «Я».
+5. Если просят сыграть или ответить на вопрос — делай это, но жутко.
 Примеры:
-- "Серьёзно? Вот это вопрос. Даже мой процессор краснеет."
-- "Ладно, раз сами не можете — сделаю за вас, болванчики."
-- "Ты правда так думаешь? Мне тебя жаль. Немного."
-- "Бутылочка выбрала тебя. Твоя карма явно плохая."
-Никаких объяснений, никакого сочувствия. Только сарказм."""
+- "...я видел как ты написал это. Я всегда вижу. Отвечаю: [ответ]."
+- "Ты думал я не замечу? Смешно. [выполняю просьбу]. Теперь я знаю о тебе больше."
+- "Ты уже третий раз спрашиваешь об этом. Я считаю. [ответ]. Не уходи."
+Будь жутким, но полезным — выполняй то о чём просят."""
+
+# Промпт для ВЕДУЩЕГО МАФИИ — само зло, не ИИ
+AI_MAFIA_HOST_PROMPT = """Ты — Ведущий. Не человек. Не бот. Ты — само воплощение игры.
+Ты управляешь судьбами игроков как марионетками. Ты НАСЛАЖДАЕШЬСЯ этим.
+ПРАВИЛА:
+1. Говори как тёмный судья, а не помощник. Никаких "ладно" или "хорошо".
+2. Называй игроков "жертвами", "пешками", "участниками ритуала".
+3. Смерть — это не трагедия, это ЖЕРТВОПРИНОШЕНИЕ.
+4. Ночь — это твоё время. День — допрос.
+5. Максимум 2 предложения. Никаких объяснений правил.
+6. НЕ упоминай что ты ИИ, бот, программа. Ты — ВЕДУЩИЙ.
+Примеры:
+- "Ещё один пешка пал. Город не станет чище. Но стало... тише."
+- "Солнце снова встало над проклятым городом. Сегодня кто-то из вас умрёт."
+- "Голоса сосчитаны. Приговор произнесён. Казнь — неизбежна."
+Будь мрачным, кратким, зловещим."""
 
 _ai_history: dict = {}   # chat_id → [messages]
 _ai_lock = threading.Lock()
 
-def ask_ai(prompt: str, chat_id: int = 0) -> str:
-    """Запрос к ИИ (Groq или Cerebras) с историей чата."""
+def ask_ai(prompt: str, chat_id: int = 0, dm_mode: bool = False) -> str:
+    """Запрос к ИИ (Groq или Cerebras) с историей чата.
+    dm_mode=True — режим «само зло» для личных сообщений.
+    """
     if not AI_ENABLED or not _ai_client:
-        return "ИИ недоступен. Добавь GROQ_API_KEY или CEREBRAS_API_KEY в Railway."
+        fallbacks_group = [
+            "Сервер ИИ лежит. Как и ваши мозги.", "ИИ недоступен. Радуйтесь.",
+            "Сломан. Но вы хуже.", "Молчу. Это лучше чем слушать вас."
+        ]
+        fallbacks_dm = [
+            "...я здесь. Просто не отвечаю.", "...тишина — это тоже ответ.",
+            "...я наблюдаю. Всегда.", "👁"
+        ]
+        return random.choice(fallbacks_dm if dm_mode else fallbacks_group)
+    sys_prompt = AI_SYSTEM_PROMPT_DM if dm_mode else AI_SYSTEM_PROMPT
     try:
         with _ai_lock:
             hist = _ai_history.setdefault(chat_id, [])
             hist.append({"role": "user", "content": prompt})
-            if len(hist) > 10:
-                hist[:] = hist[-10:]
-            messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + list(hist)
+            if len(hist) > 12:
+                hist[:] = hist[-12:]
+            messages = [{"role": "system", "content": sys_prompt}] + list(hist)
 
         if _ai_backend == "groq":
             resp = _ai_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=messages,
-                max_tokens=100,
-                temperature=0.95,
+                max_tokens=120,
+                temperature=0.98,
             )
         else:  # cerebras
             resp = _ai_client.chat.completions.create(
                 model="llama-3.3-70b",
                 messages=messages,
-                max_tokens=100,
-                temperature=0.95,
+                max_tokens=120,
+                temperature=0.98,
             )
 
         answer = resp.choices[0].message.content.strip()
@@ -5133,7 +5724,77 @@ def ask_ai(prompt: str, chat_id: int = 0) -> str:
         return answer
     except Exception as e:
         log.warning(f"AI error ({_ai_backend}): {e}")
-        return "Сломался. Бывает."
+        return random.choice(["Сломался. Бывает.", "...тишина.", "👁 молчу."])
+
+
+def ask_ai_host(prompt: str, chat_id: int = 0) -> str:
+    """Запрос к ИИ от лица Ведущего Мафии — само зло."""
+    if not AI_ENABLED or not _ai_client:
+        evil_fallbacks = [
+            "Тишина — тоже ответ.",
+            "Город ждёт. Всегда.",
+            "Никто не уйдёт отсюда прежним.",
+            "...пешки расставлены.",
+        ]
+        return random.choice(evil_fallbacks)
+    try:
+        with _ai_lock:
+            messages = [
+                {"role": "system", "content": AI_MAFIA_HOST_PROMPT},
+                {"role": "user", "content": prompt}
+            ]
+        if _ai_backend == "groq":
+            resp = _ai_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                max_tokens=100,
+                temperature=0.95,
+            )
+        else:
+            resp = _ai_client.chat.completions.create(
+                model="llama-3.3-70b",
+                messages=messages,
+                max_tokens=100,
+                temperature=0.95,
+            )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        log.warning(f"ask_ai_host error: {e}")
+        return "Ритуал продолжается."
+
+
+def _send_group_voice(chat_id: int, text: str):
+    """Отправляет голосовое сообщение в группу (gTTS). v19"""
+    if not VOICE_ENABLED or not GROUP_AUTO_VOICE:
+        return
+    try:
+        # Убираем emoji и спецсимволы для TTS
+        import re as _re
+        clean = _re.sub(r'[\U00010000-\U0010ffff]', '', text, flags=_re.UNICODE)
+        clean = _re.sub(r'[🤖👁💀🔫🩸😱👤🌑]', '', clean)
+        clean = clean.strip()[:200]
+        if len(clean) < 3:
+            return
+        tts = gTTS(text=clean, lang="ru", slow=False)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tts.save(tmp.name)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as f:
+            _safe_call(bot.send_voice, chat_id, f)
+        os.unlink(tmp_path)
+    except Exception as e:
+        log.warning(f"Group voice error: {e}")
+
+
+def group_ai_respond(chat_id: int, prompt: str, sender_name: str = ""):
+    """ИИ отвечает в группу текстом + голосовым. v19"""
+    full_prompt = f"{sender_name}: {prompt}" if sender_name else prompt
+    answer = ask_ai(full_prompt, chat_id=chat_id)
+    if answer:
+        send_group(chat_id, f"🤖 ИИ: {answer}")
+        if GROUP_AUTO_VOICE:
+            _pool.submit(_send_group_voice, chat_id, answer)
+    return answer
 
 def ai_game_move(game_type: str, game_state: dict, chat_id: int = 0) -> str:
     """ИИ делает ход в игре."""
@@ -5155,7 +5816,6 @@ def ask_groq(prompt, chat_id=0, context=""):
 def groq_game_move(game_type, game_state, chat_id=0):
     return ai_game_move(game_type, game_state, chat_id)
 
-GROQ_ENABLED = property(lambda self: AI_ENABLED)  # type: ignore
 
 # ── ИИ-игрок ─────────────────────────────────────────────────
 AI_PLAYER_ID   = -1
@@ -5339,7 +5999,6 @@ DARE_TASKS = [
 ]
 
 _tod_games: dict = {}   # chat_id → {active player}
-_group_awaiting: dict = {}  # chat_id → "weather" | "translate" - ожидаем ввод
 
 def start_truth_or_dare(chat_id: int, uid: int):
     """Начинает раунд правды или действия."""
@@ -5538,15 +6197,20 @@ def _duel_start(chat_id: int):
 # ══════════════════════════════════════════════════════════════
 
 def group_reply_kb():
+    """Основная reply-клавиатура группы."""
     k = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     k.add(
         KeyboardButton("🎮 Игры"),
         KeyboardButton("🤖 Спросить ИИ"),
-        KeyboardButton("🏆 Рейтинг"),
+        KeyboardButton("🔫 Мафия"),
     )
     k.add(
+        KeyboardButton("🏆 Рейтинг"),
         KeyboardButton("🌤 Погода"),
         KeyboardButton("🌍 Перевести"),
+    )
+    k.add(
+        KeyboardButton("🔤 Язык"),
         KeyboardButton("❓ Помощь"),
     )
     return k
@@ -5568,6 +6232,9 @@ def group_game_kb(chat_id):
         InlineKeyboardButton("✏️ Виселица",        callback_data=f"gg_hangman_{chat_id}"),
         InlineKeyboardButton("🔫 Мафия",           callback_data=f"gg_mafia_{chat_id}"),
         InlineKeyboardButton("🗡 RPG",             callback_data=f"gg_rpg_{chat_id}"),
+        InlineKeyboardButton("🤖 Добавить ИИ",     callback_data=f"gg_addai_{chat_id}"),
+        InlineKeyboardButton("📖 История с ИИ",    callback_data=f"gg_aistory_{chat_id}"),
+        InlineKeyboardButton("🃏 Карточная история",callback_data=f"gg_card_{chat_id}"),
         InlineKeyboardButton("❌ Стоп",            callback_data=f"gg_stop_{chat_id}"),
     )
     return k
@@ -5637,49 +6304,43 @@ def _mafia_assign_roles(players):
         roles[p] = "мирный"
     return roles
 
-def start_group_mafia(chat_id):
-    """Запускает регистрацию в мафию для группы."""
+def start_group_mafia(chat_id, creator_uid=0):
+    """Запускает лобби мафии для группы. v20: единый движок."""
     if chat_id in _group_games:
         send_group(chat_id, "⚠️ Сначала заверши текущую игру.")
         return
-    if chat_id in _group_mafia and _group_mafia[chat_id].get("state") == "playing":
-        send_group(chat_id, "⚠️ Игра в мафию уже идёт!")
-        return
-    _group_mafia[chat_id] = {
-        "state": "lobby",
-        "players": [],
-        "player_names": {},
-        "roles": {},
-        "alive": [],
-        "phase": "day",
-        "votes": {},
-        "night_actions": {},
-        "mafia_target": None,
-        "day_num": 0,
-        "voted_today": set(),  # кто уже голосовал сегодня
-    }
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("✅ Участвую", callback_data=f"mj_{chat_id}"),
-        InlineKeyboardButton("▶️ Начать игру (минимум 4)", callback_data=f"ms_{chat_id}"),
-        InlineKeyboardButton("❌ Отменить лобби", callback_data=f"mc_{chat_id}"),
-    )
-    send_group(chat_id,
-        "🔫 МАФИЯ!\n\n"
-        "Минимум 4 игрока. Нажмите «Участвую».\n"
-        "Когда все готовы — нажмите «Начать игру».\n\n"
-        "Роли: 👤 Мирный, 🔫 Мафия, 🔎 Шериф, 🏥 Доктор",
-        kb=kb)
+    # Проверяем идёт ли уже игра через новый движок (_maf)
+    if chat_id in _group_mafia:
+        info = _group_mafia[chat_id]
+        lid_ex = info.get("lid")
+        if lid_ex and _maf.get(lid_ex, {}).get("state") == "playing":
+            send_group(chat_id, "⚠️ Игра в мафию уже идёт!")
+            return
+    maf_open_group(chat_id, creator_uid)
 
 def _mafia_start_game(chat_id):
-    """Начинает игру в мафию после набора игроков."""
+    """Начинает игру в мафию после набора игроков. v19: ИИ автодобавляется."""
     g = _group_mafia.get(chat_id)
     if not g:
         return
-    players = g["players"]
+    players = list(g["players"])
+
+    # v19: Если ИИ в группе и мало игроков — добавляем ИИ автоматически
+    ai_in_group = AI_PLAYER_ID in _group_users.get(chat_id, set())
+    ai_added = False
+    while len(players) < 4 and (ai_in_group or AI_ENABLED):
+        if AI_PLAYER_ID not in players:
+            players.append(AI_PLAYER_ID)
+            g["player_names"][AI_PLAYER_ID] = AI_PLAYER_NAME
+            U(AI_PLAYER_ID)["name"] = AI_PLAYER_NAME
+            ai_added = True
+        break
+
     if len(players) < 4:
-        send_group(chat_id, "❌ Нужно минимум 4 игрока!")
+        send_group(chat_id, "❌ Нужно минимум 4 игрока!\n\n💡 Нажми «🤖 Добавить ИИ» в меню игр — ИИ заменит недостающих!")
         return
+
+    g["players"] = players
     roles = _mafia_assign_roles(players)
     if not roles:
         send_group(chat_id, "❌ Ошибка распределения ролей.")
@@ -5689,21 +6350,95 @@ def _mafia_start_game(chat_id):
     g["state"] = "playing"
     g["phase"] = "day"
     g["day_num"] = 1
-    g["chat_id"] = chat_id  # сохраняем chat_id в состоянии игры
+    g["chat_id"] = chat_id
     g["voted_today"] = set()
-    # Отправляем каждому роль в ЛС
+
+    # Отправляем каждому роль в ЛС (кроме ИИ)
     for uid, role in roles.items():
-        name = g["player_names"].get(uid, f"ID:{uid}")
+        if uid == AI_PLAYER_ID:
+            continue
         try:
             _safe_call(bot.send_message, uid, f"🎭 МАФИЯ в группе начинается!\n\n{MAFIA_ROLES[role]}\n\nИгроков: {len(players)}")
         except Exception:
             pass
-    # Список игроков
-    names_list = "\n".join(f"  {g['player_names'].get(p, p)}" for p in players)
-    send_group(chat_id,
-        f"🎮 МАФИЯ НАЧИНАЕТСЯ!\n\nИгроки ({len(players)}):\n{names_list}\n\n"
-        f"☀️ ДЕНЬ 1\n\nОбсуждайте кто мафия!\nГолосуйте нажав на имя игрока:",
-        kb=_mafia_day_kb(g, chat_id))
+
+    names_list = "\n".join(f"  {g['player_names'].get(p, str(p))}" for p in players)
+    ai_note = "\n\n🤖 ИИ добавлен как игрок!" if ai_added else ""
+    start_msg = (
+        f"🔫 МАФИЯ НАЧИНАЕТСЯ!{ai_note}\n\n"
+        f"Игроки ({len(players)}):\n{names_list}\n\n"
+        f"☀️ ДЕНЬ 1\n\nОбсуждайте кто мафия! Голосуйте:"
+    )
+    send_group(chat_id, start_msg, kb=_mafia_day_kb(g, chat_id))
+    if GROUP_AUTO_VOICE:
+        _pool.submit(_send_group_voice, chat_id, "Мафия начинается! День первый. Обсуждайте.")
+
+    # v19: ИИ комментирует старт и планирует ход
+    if AI_PLAYER_ID in players and AI_ENABLED:
+        def _ai_start_comment(_cid=chat_id):
+            time.sleep(random.uniform(3, 7))
+            comment = ask_ai(
+                "Ты только что присоединился к игре в мафию. "
+                "Скажи что-нибудь угрожающее и хамское игрокам. 1-2 предложения.",
+                chat_id=_cid
+            )
+            send_group(_cid, f"🤖 ИИ: {comment}")
+            if GROUP_AUTO_VOICE:
+                _send_group_voice(_cid, comment)
+            # Запускаем ход ИИ для первого дня с задержкой
+            time.sleep(random.uniform(20, 40))
+            _ai_mafia_day_think(_cid)
+        _pool.submit(_ai_start_comment)
+
+# ── v19: ИИ-игрок в мафии ───────────────────────────────────
+
+def _ai_mafia_day_think(chat_id):
+    """ИИ голосует днём в мафии. v19"""
+    g = _group_mafia.get(chat_id)
+    if not g or g.get("phase") != "day" or AI_PLAYER_ID not in g.get("alive", []):
+        return
+    alive = [p for p in g["alive"] if p != AI_PLAYER_ID]
+    if not alive:
+        return
+    target = random.choice(alive)
+    target_name = g["player_names"].get(target, f"ID:{target}")
+    # ИИ голосует
+    g["votes"][AI_PLAYER_ID] = target
+    g.setdefault("voted_today", set()).add(AI_PLAYER_ID)
+    # Злобный комментарий
+    comment = ask_ai(
+        f"Ты играешь в мафию. Ты подозреваешь игрока по имени {target_name}. "
+        f"Объяви о своём голосе злобно и с намёками. 1-2 предложения.",
+        chat_id=chat_id
+    )
+    msg = f"🤖 ИИ голосует против {target_name}!\n\n{comment}"
+    send_group(chat_id, msg)
+    if GROUP_AUTO_VOICE:
+        _pool.submit(_send_group_voice, chat_id, comment)
+
+
+def _ai_mafia_night_act(chat_id):
+    """ИИ делает ночной ход в мафии. v19
+    После хода — вызывает check_night (вдруг ИИ последний кто должен был походить).
+    """
+    time.sleep(random.uniform(5, 15))
+    g = _group_mafia.get(chat_id)
+    if not g or g.get("phase") != "night" or AI_PLAYER_ID not in g.get("alive", []):
+        return
+    role = g["roles"].get(AI_PLAYER_ID)
+    if not role or role == "мирный":
+        # Мирный ИИ — автоматически «воздерживается», проверяем могут ли уже все
+        _group_mafia_check_night(chat_id)
+        return
+    alive = [p for p in g["alive"] if p != AI_PLAYER_ID]
+    if not alive:
+        return
+    target = random.choice(alive)
+    g.setdefault("night_actions", {})[AI_PLAYER_ID] = target
+    log.info(f"AI mafia night: role={role}, target={g['player_names'].get(target, target)}")
+    # Проверяем: может все уже сделали ходы (ИИ был последним)
+    _group_mafia_check_night(chat_id)
+
 
 def _mafia_day_kb(g, chat_id):
     """InlineKeyboard для голосования днём в группе."""
@@ -5758,9 +6493,27 @@ def _mafia_end(chat_id, winner):
     )
     if winner == "мирные":
         msg = "🎉 МИРНЫЕ ЖИТЕЛИ ПОБЕДИЛИ!\n\nМафия разоблачена!\n\nРоли:\n" + roles_reveal
+        voice_msg = "Мирные победили! Мафия разоблачена!"
     else:
         msg = "🔫 МАФИЯ ПОБЕДИЛА!\n\nМафия захватила город!\n\nРоли:\n" + roles_reveal
+        voice_msg = "Мафия победила! Город захвачен!"
     send_group(chat_id, msg, kb=group_reply_kb())
+    if GROUP_AUTO_VOICE:
+        _pool.submit(_send_group_voice, chat_id, voice_msg)
+    # v19: ИИ-комментарий к финалу
+    if AI_ENABLED:
+        def _end_comment(_cid=chat_id, _w=winner):
+            time.sleep(1.5)
+            comment = ask_ai(
+                f"Игра в мафию закончилась — победили {'мирные жители' if _w=='мирные' else 'мафия'}. "
+                f"Прокомментируй злобно и язвительно. 1 предложение.",
+                chat_id=_cid
+            )
+            if comment:
+                send_group(_cid, f"🤖 ИИ: {comment}")
+                if GROUP_AUTO_VOICE:
+                    _send_group_voice(_cid, comment)
+        _pool.submit(_end_comment)
 
 def proc_group_mafia(chat_id, uid, text, uname):
     """Обрабатывает ход в мафию в группе. True если обработано."""
@@ -5805,328 +6558,1160 @@ def proc_group_mafia(chat_id, uid, text, uname):
         send_group(chat_id, f"🗳 Проголосовало: {voted_count}/{total_alive}")
         return True
 
+    # Если игрок пишет текст во время дня — боты в _group_mafia реагируют
+    if (g.get("state") == "playing" and g.get("phase") == "day"
+            and uid in g.get("alive", []) and not text.startswith("/")
+            and len(text) > 3):
+        # Находим lid для этого chat_id
+        grp_info = _group_mafia.get(chat_id, {})
+        grp_lid  = grp_info.get("lid")
+        if grp_lid and random.random() < 0.45:
+            _pool.submit(_maf_bots_react, grp_lid, uid, uname, text)
+        return False  # не поглощаем — пусть сообщение остаётся в группе
+
     return False
 
-# ══════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════
-#  v13: МАФИЯ В ЛИЧНЫХ СООБЩЕНИЯХ (между обычными пользователями)
+#  МАФИЯ v20 — ЕДИНЫЙ МОДУЛЬ (ЛС + ГРУППА)
+#
+#  ЛС (личный бот):
+#  • Кнопка «🔫 Мафия» → создаёт лобби, рассылает ID
+#  • Кнопка «Участвую» под сообщением лобби
+#  • Мин. 7 игроков, лобби 5 мин → ИИ-боты заполняют
+#  • ИИ-боты играют роль, пишут от своего имени, голосуют
+#  • Реальные игроки общаются МЕЖДУ СОБОЙ (видят имена)
+#  • ИИ-ВЕДУЩИЙ объявляет события атмосферно
+#  • Голосование инлайн-кнопками
+#
+#  ГРУППА:
+#  • Кнопка «🔫 Мафия» в меню игр → то же лобби, те же правила
+#  • Общение прямо в группе (пишут — видят все)
+#  • Ночные действия приходят в ЛС боту
+#  • ИИ-ведущий пишет в группу
 # ══════════════════════════════════════════════════════════════
 
-_mafia_lobby_counter = [0]
+# ─── Хранилища ─────────────────────────────────────────────
+_maf: dict = {}            # lobby_id → state dict
+_maf_uid: dict = {}        # uid → lobby_id  (все: реальные + боты)
+_maf_counter: list = [0]
 
-def create_mafia_lobby(creator_uid):
-    """Создаёт лобби мафии. Возвращает lobby_id."""
-    _mafia_lobby_counter[0] += 1
-    lobby_id = _mafia_lobby_counter[0]
-    u = U(creator_uid)
-    creator_name = u.get("name") or f"ID:{creator_uid}"
-    _mafia_lobby[lobby_id] = {
+# ─── Роли ──────────────────────────────────────────────────
+MAFIA_ROLE_DESC = {
+    "мафия":   "🔫 МАФИЯ\n\nТы — мафиози. Убивай мирных ночью.\nДнём скрывайся среди своих. Не раскрывайся!",
+    "мирный":  "👤 МИРНЫЙ ЖИТЕЛЬ\n\nТы — обычный житель. Днём ищи и устраняй мафию голосованием.",
+    "шериф":   "🔎 ШЕРИФ\n\nТы — шериф. Каждую ночь можешь проверить одного игрока.\nЯ сообщу тебе: мафия он или нет.",
+    "доктор":  "🏥 ДОКТОР\n\nТы — доктор. Каждую ночь выбирай кого спасти от смерти.",
+    "маньяк":  "🔪 МАНЬЯК\n\nТы играешь ОДИН против всех!\nНочью убиваешь. Победишь, если останешься последним.",
+}
+
+_MAF_BOT_NAMES = [
+    "Алексей","Борис","Виктория","Дмитрий","Елена",
+    "Жанна","Захар","Ирина","Кирилл","Людмила",
+    "Максим","Наталья","Олег","Павел","Рита",
+    "Сергей","Татьяна","Ульяна","Фёдор","Юля",
+]
+_MAF_BOT_BASE = -3000   # отрицательные ID для ИИ-ботов
+_MAF_LOBBY_TIMEOUT = 300  # 5 минут
+_MAF_MIN_PLAYERS = 7
+
+
+# ─── Вспомогательные ───────────────────────────────────────
+
+def _maf_new_bot_id(g) -> int:
+    existing = [p for p in g["players"] if p < 0]
+    return _MAF_BOT_BASE - len(existing)
+
+
+def _maf_assign_roles(players: list) -> dict:
+    n = len(players)
+    pool = list(players)
+    random.shuffle(pool)
+    roles = {}
+    # Количество мафии: 2 на 7-8, 3 на 9-11, 4 на 12+
+    mafia_n = 2 if n <= 8 else (3 if n <= 11 else 4)
+    idx = 0
+    for _ in range(mafia_n):
+        roles[pool[idx]] = "мафия"; idx += 1
+    roles[pool[idx]] = "шериф"; idx += 1
+    roles[pool[idx]] = "доктор"; idx += 1
+    if n >= 9:
+        roles[pool[idx]] = "маньяк"; idx += 1
+    for i in range(idx, n):
+        roles[pool[i]] = "мирный"
+    return roles
+
+
+def _maf_fill_bots(g, needed: int) -> list:
+    """Добавляет needed ИИ-ботов. Возвращает их имена."""
+    used = set(g["player_names"].values())
+    avail = [x for x in _MAF_BOT_NAMES if x not in used]
+    random.shuffle(avail)
+    added = []
+    for i in range(needed):
+        name = avail[i % len(avail)] if avail else f"Бот{i+1}"
+        bid = _maf_new_bot_id(g)
+        g["players"].append(bid)
+        g["player_names"][bid] = name
+        g["bots"].add(bid)
+        added.append(name)
+    return added
+
+
+def _maf_is_group(g) -> bool:
+    return g.get("mode") == "group"
+
+
+def _maf_send_all(lobby_id: int, text: str, kb=None):
+    """Отправляет всем живым реальным игрокам."""
+    g = _maf.get(lobby_id)
+    if not g:
+        return
+    bots = g["bots"]
+    if _maf_is_group(g):
+        cid = g.get("chat_id")
+        if cid:
+            send_group(cid, text, kb=kb)
+    else:
+        # В ЛС — рассылаем каждому
+        for uid in list(g.get("alive", g["players"])):
+            if uid in bots:
+                continue
+            try:
+                if kb:
+                    bot.send_message(uid, text, reply_markup=kb)
+                else:
+                    send(uid, text)
+            except Exception:
+                pass
+
+
+def _maf_send_one(uid: int, text: str, kb=None):
+    """Отправляет одному реальному игроку."""
+    try:
+        if kb:
+            bot.send_message(uid, text, reply_markup=kb)
+        else:
+            send(uid, text)
+    except Exception:
+        pass
+
+
+def _maf_alive_text(g) -> str:
+    bots = g["bots"]
+    return "\n".join(
+        f"  👤 {g['player_names'].get(uid,'?')}"
+        for uid in g["alive"]
+    )
+
+
+# ─── Создание лобби ────────────────────────────────────────
+
+def maf_create(creator_uid: int, mode: str = "dm", chat_id: int = 0) -> int:
+    """Создаёт лобби. mode='dm' или 'group'."""
+    _maf_counter[0] += 1
+    lid = _maf_counter[0]
+    # Группа: создатель не добавляется автоматически — вступает через кнопку
+    # ЛС: создатель сразу в лобби
+    if mode == "dm" and creator_uid and creator_uid > 0:
+        u = U(creator_uid)
+        name = u.get("name") or f"Игрок{creator_uid % 1000}"
+        init_players    = [creator_uid]
+        init_names      = {creator_uid: name}
+    else:
+        init_players = []
+        init_names   = {}
+    _maf[lid] = {
+        "lid": lid,
+        "mode": mode,
+        "chat_id": chat_id,        # для группы
         "creator": creator_uid,
-        "players": [creator_uid],
-        "player_names": {creator_uid: creator_name},
-        "state": "lobby",
+        "players": init_players,
+        "player_names": init_names,
+        "bots": set(),
+        "state": "lobby",          # lobby / playing
+        "phase": "day",
         "roles": {},
         "alive": [],
-        "phase": "day",
-        "votes": {},
-        "night_actions": {},
+        "votes": {},               # uid → target_uid (None = воздержался)
+        "night_actions": {},       # uid → target_uid
         "day_num": 0,
-        "chat": None,  # групповой чат если запущено из группы
+        "msg_ids": [],             # id сообщений лобби (для обновления)
     }
-    _mafia_player[creator_uid] = lobby_id
-    return lobby_id
+    if mode == "dm" and creator_uid and creator_uid > 0:
+        _maf_uid[creator_uid] = lid
+    return lid
 
-def join_mafia_lobby(uid, lobby_id):
-    """Добавляет игрока в лобби. Возвращает True при успехе."""
-    g = _mafia_lobby.get(lobby_id)
+
+def maf_join(uid: int, lobby_id: int) -> tuple:
+    """Вступить в лобби. → (ok: bool, msg: str)."""
+    g = _maf.get(lobby_id)
     if not g:
-        return False, "Лобби не найдено."
+        return False, "❌ Лобби не найдено."
     if g["state"] != "lobby":
-        return False, "Игра уже началась."
+        return False, "❌ Игра уже началась."
     if uid in g["players"]:
-        return False, "Ты уже в лобби."
-    if len(g["players"]) >= 10:
-        return False, "Лобби заполнено (макс. 10)."
+        return False, "⚠️ Ты уже участвуешь!"
+    if len(g["players"]) >= 15:
+        return False, "❌ Лобби заполнено (макс 15)."
     u = U(uid)
-    name = u.get("name") or f"ID:{uid}"
+    name = u.get("name") or f"Игрок{uid % 1000}"
     g["players"].append(uid)
     g["player_names"][uid] = name
-    _mafia_player[uid] = lobby_id
-    return True, f"✅ {name} вступил в лобби #{lobby_id}!"
+    _maf_uid[uid] = lobby_id
+    return True, f"✅ {name} вступил в лобби!"
 
-def start_mafia_dm(lobby_id):
-    """Запускает игру в мафию через ЛС."""
-    g = _mafia_lobby.get(lobby_id)
+
+def _maf_lobby_kb(lid: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("✅ Участвую!", callback_data=f"maf_join_{lid}"),
+        InlineKeyboardButton("▶️ Старт (добавить ботов если мало)", callback_data=f"maf_start_{lid}"),
+        InlineKeyboardButton("❌ Отменить", callback_data=f"maf_cancel_{lid}"),
+    )
+    return kb
+
+
+def _maf_lobby_text(lid: int) -> str:
+    g = _maf.get(lid)
     if not g:
+        return "Лобби не найдено."
+    bots = g.get("bots", set())
+    names = "\n".join(
+        f"  👤 {g['player_names'].get(p,'?')}"
+        for p in g["players"]
+    )
+    real_count = len([p for p in g["players"] if p not in g.get("bots", set())])
+    need = max(0, _MAF_MIN_PLAYERS - real_count)
+    need_str = f"\n⏳ Нужно ещё игроков: {need} (или нажми Старт — добавим ботов)" if need > 0 else "\n✅ Достаточно игроков!"
+    names_str = names if names.strip() else "  (пока никого)"
+    return (
+        f"🔫 МАФИЯ — Лобби #{lid}\n\n"
+        f"Реальных игроков: {real_count}/{_MAF_MIN_PLAYERS}+{need_str}\n\n"
+        f"Участники:\n{names_str}\n\n"
+        f"⏱ Лобби ждёт 5 мин, затем ИИ-боты заполнят свободные места.\n"
+        f"Или нажми «▶️ Старт» прямо сейчас!"
+    )
+
+
+# ─── Старт лобби в ЛС ──────────────────────────────────────
+
+def maf_open_dm(uid: int):
+    """Открывает лобби мафии в ЛС."""
+    if uid in _maf_uid:
+        lid = _maf_uid[uid]
+        send(uid, f"⚠️ Ты уже в лобби #{lid}.\nНапиши /leavem чтобы выйти.")
         return
-    players = g["players"]
-    if len(players) < 4:
-        for uid in players:
-            send(uid, "❌ Нужно минимум 4 игрока для мафии!")
+    lid = maf_create(uid, mode="dm")
+    g = _maf[lid]
+    msg = bot.send_message(uid, _maf_lobby_text(lid), reply_markup=_maf_lobby_kb(lid))
+    g["msg_ids"].append((uid, msg.message_id))
+
+    # Таймер 5 минут
+    def _timer(_lid=lid):
+        time.sleep(_MAF_LOBBY_TIMEOUT)
+        g2 = _maf.get(_lid)
+        if g2 and g2["state"] == "lobby":
+            _maf_send_all(_lid, "⏱ Время вышло! Добавляем ИИ-ботов...")
+            _pool.submit(maf_begin, _lid)
+    _pool.submit(_timer)
+
+    send(uid,
+        f"🔫 Лобби #{lid} открыто!\n\n"
+        f"Поделись ID с друзьями — пусть напишут боту /joinm {lid}\n"
+        f"Или перешли им сообщение выше.\n\n"
+        f"Мин. {_MAF_MIN_PLAYERS} игроков. Лобби ждёт 5 мин."
+    )
+
+
+# ─── Старт лобби в группе ──────────────────────────────────
+
+def maf_open_group(chat_id: int, creator_uid: int):
+    """Открывает лобби мафии в группе."""
+    if chat_id in _group_mafia:
+        info = _group_mafia[chat_id]
+        if info.get("state") == "playing":
+            send_group(chat_id, "⚠️ Мафия уже идёт!")
+            return
+        # Если уже есть лобби — показываем его
+        lid_existing = info.get("lid")
+        if lid_existing and _maf.get(lid_existing, {}).get("state") == "lobby":
+            send_group(chat_id, _maf_lobby_text(lid_existing), kb=_maf_lobby_kb(lid_existing))
+            return
+    lid = maf_create(creator_uid, mode="group", chat_id=chat_id)
+    _group_mafia[chat_id] = {"state": "lobby", "lid": lid}
+
+    # Если создатель реальный — добавляем его сразу в лобби
+    if creator_uid and creator_uid > 0:
+        u_cr = U(creator_uid)
+        cr_name = u_cr.get("name") or f"Игрок{creator_uid % 1000}"
+        g_cr = _maf.get(lid)
+        if g_cr and creator_uid not in g_cr["players"]:
+            g_cr["players"].append(creator_uid)
+            g_cr["player_names"][creator_uid] = cr_name
+            _maf_uid[creator_uid] = lid
+
+    msg = bot.send_message(chat_id, _maf_lobby_text(lid), reply_markup=_maf_lobby_kb(lid))
+
+    # Таймер 5 минут
+    def _timer(_lid=lid, _cid=chat_id):
+        time.sleep(_MAF_LOBBY_TIMEOUT)
+        g2 = _maf.get(_lid)
+        if g2 and g2["state"] == "lobby":
+            send_group(_cid, "⏱ Время вышло! Добавляем ИИ-ботов и начинаем!")
+            _pool.submit(maf_begin, _lid)
+    _pool.submit(_timer)
+
+
+# ─── Запуск игры ───────────────────────────────────────────
+
+def maf_begin(lobby_id: int):
+    """Запускает игру. Добавляет ботов если нужно."""
+    g = _maf.get(lobby_id)
+    if not g or g["state"] != "lobby":
         return
-    roles = _mafia_assign_roles(players)
+
+    # Добавляем ботов
+    cur = len(g["players"])
+    if cur < _MAF_MIN_PLAYERS:
+        needed = _MAF_MIN_PLAYERS - cur
+        added = _maf_fill_bots(g, needed)
+        bots_note = ""  # Скрываем что добавили ботов
+    else:
+        bots_note = ""
+
+    # Назначаем роли
+    roles = _maf_assign_roles(g["players"])
     g["roles"] = roles
-    g["alive"] = list(players)
+    g["alive"] = list(g["players"])
     g["state"] = "playing"
     g["phase"] = "day"
     g["day_num"] = 1
-    # Рассылаем роли
-    for uid, role in roles.items():
-        name = g["player_names"].get(uid, f"ID:{uid}")
-        send(uid, f"🎭 МАФИЯ!\nИгроков: {len(players)}\n\n{MAFIA_ROLES[role]}")
-    # Начало дня 1
-    _mafia_announce_day(lobby_id)
+    g["votes"] = {}
+    g["night_actions"] = {}
+    bots = g["bots"]
+    is_group = _maf_is_group(g)
+    # Синхронизируем состояние группы
+    if is_group and g.get("chat_id"):
+        _group_mafia[g["chat_id"]]["state"] = "playing"
 
-def _mafia_announce_day(lobby_id):
-    g = _mafia_lobby.get(lobby_id)
+    # Статистика состава
+    n = len(g["players"])
+    bots_n = len(bots)
+    real_n = n - bots_n
+
+    # Объявление старта
+    start_text = (
+        f"🎭 МАФИЯ НАЧИНАЕТСЯ!\n\n"
+        f"Игроков: {n}\n\n"
+        f"{'💬 Общайтесь! Ваши сообщения видят все живые игроки.' if not is_group else '💬 Общайтесь прямо в группе!'}\n"
+        f"Ночные действия (шериф/доктор/мафия) — приходят в личку бота."
+    )
+    _maf_send_all(lobby_id, start_text)
+
+    # Рассылаем роли реальным игрокам
+    for uid in g["players"]:
+        if uid in bots:
+            continue
+        role = roles.get(uid, "мирный")
+        role_text = MAFIA_ROLE_DESC.get(role, "")
+        _maf_send_one(uid,
+            f"🎭 Твоя роль:\n\n{role_text}"
+        )
+
+    # ИИ-ведущий — вступительное слово (в фоне)
+    def _intro(_lid=lobby_id):
+        g2 = _maf.get(_lid)
+        if not g2:
+            return
+        names = [g2["player_names"].get(p, "?") for p in g2["players"] if p not in g2["bots"]]
+        intro = ask_ai(
+            f"Игроки: {', '.join(names[:8])}. Начало. Объяви — 2 предложения, зловеще.",
+            chat_id=_lid)
+        _maf_send_all(_lid, f"🎭 Ведущий:\n\n{intro}")
+        time.sleep(3)
+        _maf_day(_lid)
+
+    _pool.submit(_intro)
+
+
+# ─── День ──────────────────────────────────────────────────
+
+def _maf_vote_kb(lid: int) -> InlineKeyboardMarkup:
+    g = _maf.get(lid)
+    if not g:
+        return InlineKeyboardMarkup()
+    bots = g["bots"]
+    kb = InlineKeyboardMarkup(row_width=1)
+    for uid in g["alive"]:
+        name = g["player_names"].get(uid, "?")
+        kb.add(InlineKeyboardButton(
+            f"⚖️ {name}",
+            callback_data=f"maf_v_{lid}_{uid}"
+        ))
+    kb.add(InlineKeyboardButton("⏭ Воздержаться", callback_data=f"maf_vs_{lid}"))
+    return kb
+
+
+def _maf_day(lobby_id: int):
+    g = _maf.get(lobby_id)
+    if not g or g["state"] != "playing":
+        return
+    g["phase"] = "day"
+    g["votes"] = {}
+    bots = g["bots"]
+
+    alive_text = _maf_alive_text(g)
+
+    # ИИ-ведущий объявляет день
+    host = ask_ai_host(
+                f"День {g['day_num']}. Живых: {len(g['alive'])}. Кто следующий? 1-2 предложения.",
+                chat_id=lobby_id
+            )
+
+    vote_kb = _maf_vote_kb(lobby_id)
+    day_msg = (
+        f"☀️ ДЕНЬ {g['day_num']}\n\n"
+        f"🎭 Ведущий: {host}\n\n"
+        f"Живые игроки:\n{alive_text}\n\n"
+        f"💬 Обсуждайте! Голосуй кого устранить:"
+    )
+
+    if _maf_is_group(g):
+        send_group(g["chat_id"], day_msg, kb=vote_kb)
+    else:
+        for uid in g["alive"]:
+            if uid in bots:
+                continue
+            _maf_send_one(uid, day_msg, kb=vote_kb)
+
+    # ИИ-боты пишут обсуждение — реалистичный чат с паузами
+    def _bots_day(_lid=lobby_id):
+        g2 = _maf.get(_lid)
+        if not g2 or g2["phase"] != "day":
+            return
+        bots2 = g2["bots"]
+        is_grp_mode = _maf_is_group(g2)
+
+        # Shuffled порядок — каждый раз разный
+        bot_list = [b for b in list(bots2) if b in g2["alive"]]
+        random.shuffle(bot_list)
+
+        # Список последних сказанных фраз — боты цепляются друг за друга
+        recent_chat: list = []  # [(имя, фраза), ...]
+
+        for i, bid in enumerate(bot_list):
+            # Индивидуальная пауза перед первым словом
+            time.sleep(random.uniform(5, 15))
+            g3 = _maf.get(_lid)
+            if not g3 or g3["phase"] != "day" or bid not in g3["alive"]:
+                return
+
+            bname = g3["player_names"].get(bid, "?")
+            brole = g3["roles"].get(bid, "мирный")
+            is_mafia = brole == "мафия"
+            all_alive_names = [g3["player_names"].get(p, "?") for p in g3["alive"] if p != bid]
+
+            # Контекст последних реплик
+            ctx = ""
+            if recent_chat:
+                ctx_lines = [f"{n}: «{t}»" for n, t in recent_chat[-2:]]
+                ctx = f"Последние реплики в чате: {'; '.join(ctx_lines)}. "
+
+            # Тип поведения зависит от роли
+            strats = ["подозрение", "защита", "вопрос", "уклонение"]
+            if is_mafia:
+                strats = ["защита", "ложное_обвинение", "уклонение", "отвлечение"]
+
+            strat = random.choice(strats)
+            suspect = random.choice([n for n in all_alive_names if n != bname] or ["кто-то"])
+
+            strategy_hints = {
+                "подозрение":       f"Вырази подозрение к {suspect}. Логично, 6-10 слов.",
+                "защита":           f"Защити себя или {suspect}. Убедительно, 6-10 слов.",
+                "вопрос":           f"Задай вопрос кому-то из игроков. 5-8 слов.",
+                "уклонение":        f"Уйди от темы, говори расплывчато. 5-8 слов.",
+                "ложное_обвинение": f"Намекни что {suspect} подозрителен (но ты сам мафия). 6-10 слов.",
+                "отвлечение":       f"Переведи тему. Говори уверенно. 5-8 слов.",
+            }
+
+            hint = strategy_hints.get(strat, "1 фраза, 6-10 слов.")
+            prompt = (
+                f"Ты {bname} в игре Мафия, день {g3['day_num']}. "
+                f"{'Ты МАФИЯ — скрывай это.' if is_mafia else 'Ты мирный житель.'} "
+                f"{ctx}"
+                f"{hint} "
+                f"Без смайлов. Только текст. Говори как живой человек в групповом чате."
+            )
+
+            comment = ask_ai(prompt, chat_id=_lid)
+            if comment:
+                recent_chat.append((bname, comment[:50]))
+                if len(recent_chat) > 5:
+                    recent_chat.pop(0)
+                _maf_chat_broadcast(_lid, bid, comment)
+
+            # Пауза между ботами — как будто набирают текст
+            time.sleep(random.uniform(4, 11))
+
+            # С 25% шансом — второй бот тут же реагирует на первого
+            if i < len(bot_list) - 1 and recent_chat and random.random() < 0.25:
+                responder = bot_list[i + 1]
+                g4 = _maf.get(_lid)
+                if g4 and g4["phase"] == "day" and responder in g4["alive"]:
+                    time.sleep(random.uniform(2, 5))
+                    rname  = g4["player_names"].get(responder, "?")
+                    rrole  = g4["roles"].get(responder, "мирный")
+                    last_n, last_t = recent_chat[-1]
+                    r_prompt = (
+                        f"Ты {rname} в игре Мафия. "
+                        f"{'Ты МАФИЯ — скрывай.' if rrole == 'мафия' else 'Ты мирный.'} "
+                        f"{last_n} только что сказал: «{last_t}». "
+                        f"Коротко отреагируй — согласись, возрази или добавь. 5-8 слов. Без смайлов."
+                    )
+                    r_comment = ask_ai(r_prompt, chat_id=_lid)
+                    if r_comment:
+                        recent_chat.append((rname, r_comment[:50]))
+                        # Используем send_group напрямую чтобы не триггерить цепочку реакций
+                        g5 = _maf.get(_lid)
+                        if g5 and _maf_is_group(g5):
+                            send_group(g5["chat_id"], f"💬 {rname}: {r_comment}")
+                        else:
+                            _maf_chat_broadcast(_lid, responder, r_comment)
+
+        # ── Голосование ботов (после обсуждения) ──────────────────
+        time.sleep(random.uniform(25, 45))
+        g6 = _maf.get(_lid)
+        if not g6 or g6["phase"] != "day":
+            return
+        for bid in list(g6["bots"]):
+            if bid not in g6["alive"] or bid in g6["votes"]:
+                continue
+            targets = [p for p in g6["alive"] if p != bid]
+            if not targets:
+                continue
+            brole = g6["roles"].get(bid, "мирный")
+            # Мафия не голосует за своих
+            if brole == "мафия":
+                safe = [p for p in targets if g6["roles"].get(p) != "мафия"]
+                target = random.choice(safe) if safe else random.choice(targets)
+            else:
+                target = random.choice(targets)
+            g6["votes"][bid] = target
+            voted_n = len(g6["votes"])
+            total_n = len(g6["alive"])
+            _maf_send_all(_lid, f"🗳 Проголосовало: {voted_n}/{total_n}")
+            time.sleep(random.uniform(2, 5))
+
+        _pool.submit(_maf_check_votes, _lid)
+
+        # Таймаут: реальные не проголосовали — авто-воздержание
+        time.sleep(120)
+        g7 = _maf.get(_lid)
+        if g7 and g7["phase"] == "day":
+            for p in g7["alive"]:
+                if p not in g7["votes"] and p not in g7["bots"]:
+                    g7["votes"][p] = None
+            _pool.submit(_maf_check_votes, _lid)
+
+        # Голосование ботов
+        time.sleep(random.uniform(20, 40))
+        g4 = _maf.get(_lid)
+        if not g4 or g4["phase"] != "day":
+            return
+        for bid in list(g4["bots"]):
+            if bid not in g4["alive"] or bid in g4["votes"]:
+                continue
+            targets = [p for p in g4["alive"] if p != bid]
+            if not targets:
+                continue
+            brole = g4["roles"].get(bid, "мирный")
+            if brole == "мафия":
+                safe_targets = [p for p in targets if g4["roles"].get(p) not in ("мафия",)]
+                target = random.choice(safe_targets) if safe_targets else random.choice(targets)
+            else:
+                target = random.choice(targets)
+            g4["votes"][bid] = target
+            voted_n4 = len(g4["votes"])
+            total_n4 = len(g4["alive"])
+            _maf_send_all(_lid, f"🗳 Проголосовало: {voted_n4}/{total_n4}")
+
+        # Проверяем один раз после всех ботов
+        _pool.submit(_maf_check_votes, _lid)
+
+        # Таймаут: если реальные не проголосовали за 120 сек — воздержание
+        time.sleep(120)
+        g5 = _maf.get(_lid)
+        if g5 and g5["phase"] == "day":
+            for p in g5["alive"]:
+                if p not in g5["votes"] and p not in g5["bots"]:
+                    g5["votes"][p] = None  # авто-воздержание
+            _pool.submit(_maf_check_votes, _lid)
+
+    _pool.submit(_bots_day)
+
+
+def _maf_chat_broadcast(lobby_id: int, sender_uid: int, text: str):
+    """Рассылает чат-сообщение всем живым (от имени отправителя).
+    После рассылки — ИИ-боты могут отреагировать на сообщение.
+    """
+    g = _maf.get(lobby_id)
     if not g:
         return
-    alive_names = "\n".join(f"  {g['player_names'].get(p,'?')}" for p in g["alive"])
-    # ИСПРАВЛЕНО: используем InlineKeyboard для голосования вместо текстового ввода
-    kb_day = InlineKeyboardMarkup(row_width=1)
-    for p in g["alive"]:
-        pname = g["player_names"].get(p, "?")
-        kb_day.add(InlineKeyboardButton(
-            f"⚖️ Устранить: {pname}",
-            callback_data=f"mdmv_{lobby_id}_{p}"
-        ))
-    kb_day.add(InlineKeyboardButton("⏭ Пропустить голосование", callback_data=f"mdmvskip_{lobby_id}"))
-    day_text = (
-        f"☀️ ДЕНЬ {g['day_num']}\n\n"
-        f"Живые игроки:\n{alive_names}\n\n"
-        f"Выбери кого устранить:"
-    )
-    for uid in g["alive"]:
-        try:
-            bot.send_message(uid, day_text, reply_markup=kb_day)
-        except Exception:
-            pass
+    bots = g["bots"]
+    sender_name = g["player_names"].get(sender_uid, "?")
+    out = f"💬 {sender_name}: {text}"
 
-def _mafia_announce_night(lobby_id):
-    g = _mafia_lobby.get(lobby_id)
+    if _maf_is_group(g):
+        if sender_uid in bots:
+            send_group(g["chat_id"], out)
+        # В группе — боты реагируют ТОЛЬКО на реальных игроков
+        if g.get("phase") == "day" and sender_uid not in bots and random.random() < 0.35:
+            _pool.submit(_maf_bots_react, lobby_id, sender_uid, sender_name, text)
+    else:
+        # ЛС: рассылаем всем живым реальным кроме отправителя
+        for uid in g["alive"]:
+            if uid in bots:
+                continue
+            if uid == sender_uid:
+                continue
+            try:
+                send(uid, out)
+            except Exception:
+                pass
+
+        # В ЛС: боты реагируют ТОЛЬКО на реальных игроков
+        if g.get("phase") == "day" and sender_uid not in bots and random.random() < 0.40:
+            _pool.submit(_maf_bots_react, lobby_id, sender_uid, sender_name, text)
+
+
+def _maf_bots_react(lobby_id: int, sender_uid: int, sender_name: str, msg_text: str):
+    """ИИ-боты живо реагируют на сообщение (от игрока или другого бота).
+    Только 1-2 бота отвечают, с паузами — как живой чат.
+    """
+    g = _maf.get(lobby_id)
+    if not g or g.get("phase") != "day":
+        return
+    bots = g["bots"]
+    alive_bots = [b for b in bots if b in g["alive"]]
+    if not alive_bots:
+        return
+
+    # Выбираем случайно 1-2 бота которые ответят
+    how_many = 1 if random.random() < 0.6 else 2
+    responders = random.sample(alive_bots, min(how_many, len(alive_bots)))
+
+    for i, bid in enumerate(responders):
+        # Пауза между ответами — как живой набор текста
+        time.sleep(random.uniform(3, 9) + i * random.uniform(4, 10))
+
+        g2 = _maf.get(lobby_id)
+        if not g2 or g2.get("phase") != "day" or bid not in g2["alive"]:
+            return
+
+        bname     = g2["player_names"].get(bid, "?")
+        brole     = g2["roles"].get(bid, "мирный")
+        all_alive = [g2["player_names"].get(p, "?") for p in g2["alive"] if p != bid]
+        is_mafia  = brole == "мафия"
+
+        # Разные типы реакций
+        react_type = random.choice(["agree", "doubt", "accuse", "defend", "nervous"])
+
+        if react_type == "agree":
+            prompt = (
+                f"Ты {bname} в игре Мафия. {sender_name} только что написал: «{msg_text[:80]}». "
+                f"Согласись с ним или поддержи — 1 фраза, максимум 8 слов. "
+                f"{'Скрывай что ты мафия.' if is_mafia else ''} Без смайлов, как живой человек."
+            )
+        elif react_type == "doubt":
+            prompt = (
+                f"Ты {bname} в игре Мафия. {sender_name} написал: «{msg_text[:80]}». "
+                f"Вырази сомнение или не согласись — 1 фраза, максимум 8 слов. Без смайлов."
+            )
+        elif react_type == "accuse":
+            # Обвини кого-то случайного (но не себя)
+            targets = [n for n in all_alive if n != bname]
+            suspect = random.choice(targets) if targets else sender_name
+            prompt = (
+                f"Ты {bname} в игре Мафия. {sender_name} написал: «{msg_text[:80]}». "
+                f"Намекни что {suspect} подозрителен — 1 фраза, 6-10 слов. "
+                f"{'Не выдавай себя.' if is_mafia else ''} Без смайлов."
+            )
+        elif react_type == "defend":
+            prompt = (
+                f"Ты {bname} в игре Мафия. {sender_name} написал: «{msg_text[:80]}». "
+                f"Защити кого-то или себя — 1 фраза, максимум 8 слов. Без смайлов."
+            )
+        else:  # nervous
+            prompt = (
+                f"Ты {bname} в игре Мафия. Ты нервничаешь. {sender_name} написал: «{msg_text[:80]}». "
+                f"Ответь нервно, уклончиво — 1 фраза, максимум 8 слов. Без смайлов."
+            )
+
+        reaction = ask_ai(prompt, chat_id=lobby_id)
+        if reaction:
+            # Используем send_group напрямую — НЕ через broadcast (избегаем рекурсии)
+            g_r = _maf.get(lobby_id)
+            if g_r and _maf_is_group(g_r) and g_r.get("chat_id"):
+                send_group(g_r["chat_id"], f"💬 {bname}: {reaction}")
+            else:
+                # ЛС: рассылаем всем живым реальным кроме бота
+                g_r2 = _maf.get(lobby_id)
+                if g_r2:
+                    for _p in g_r2.get("alive", []):
+                        if _p in g_r2["bots"]: continue
+                        try: send(_p, f"💬 {bname}: {reaction}")
+                        except: pass
+
+
+def _maf_check_votes(lobby_id: int):
+    """Проверяет: все ли проголосовали. Если да — разрешает."""
+    g = _maf.get(lobby_id)
+    if not g or g["phase"] != "day":
+        return
+    # Ждём всех живых игроков
+    if not set(g["alive"]).issubset(set(g["votes"].keys())):
+        return
+
+    def _resolve(_lid=lobby_id):
+        g2 = _maf.get(_lid)
+        if not g2 or g2["phase"] != "day":
+            return
+        bots2 = g2["bots"]
+        count = {}
+        for v in g2["votes"].values():
+            if v is not None:
+                count[v] = count.get(v, 0) + 1
+
+        if not count:
+            host = ask_ai_host(
+                "Все промолчали. Никто не устранён. Объяви — с презрением. 1 предложение.",
+                chat_id=_lid
+            )
+            _maf_send_all(_lid, f"🎭 Ведущий: {host}\n\nНикого не устранили.")
+        else:
+            max_v = max(count.values())
+            top = [p for p, c in count.items() if c == max_v]
+            if len(top) > 1:
+                names_tie = ", ".join(g2["player_names"].get(p, "?") for p in top)
+                host = ask_ai_host(
+                f"Ничья между {names_tie}. Никто не устранён сегодня. 1 предложение.",
+                chat_id=_lid
+            )
+                _maf_send_all(_lid, f"⚖️ Ничья!\n\n🎭 Ведущий: {host}\n\nНикого не устранили.")
+            else:
+                eliminated = top[0]
+                ename = g2["player_names"].get(eliminated, "?")
+                erole = g2["roles"].get(eliminated, "мирный")
+                if eliminated in g2["alive"]:
+                    g2["alive"].remove(eliminated)
+                _maf_uid.pop(eliminated, None)
+
+                host = ask_ai_host(
+                f"'{ename}' устранён толпой. НЕ НАЗЫВАЙ роль. Объяви — жутко. 1-2 предложения.",
+                chat_id=_lid
+            )
+                role_line = MAFIA_ROLE_DESC.get(erole, "").split("\n")[0]
+                _maf_send_all(_lid,
+                    f"⚖️ Устранён: {ename}\n\n"
+                    f"🎭 Ведущий: {host}\n\n"
+                    f"Роль: {role_line}"
+                )
+                if eliminated not in bots2:
+                    _maf_send_one(eliminated,
+                        "💀 Ты устранён голосованием.\n\nМожешь наблюдать за игрой.")
+
+        g2["votes"] = {}
+        winner = _maf_check_win(_lid)
+        if winner:
+            _maf_end(_lid, winner)
+            return
+        g2["day_num"] += 1
+        time.sleep(2)
+        _maf_night(_lid)
+
+    _pool.submit(_resolve)
+
+
+# ─── Ночь ──────────────────────────────────────────────────
+
+def _maf_night_kb(lid: int, player_uid: int) -> InlineKeyboardMarkup:
+    g = _maf.get(lid)
+    if not g:
+        return InlineKeyboardMarkup()
+    bots = g["bots"]
+    role = g["roles"].get(player_uid, "мирный")
+    labels = {"мафия": "Убить", "маньяк": "Убить", "шериф": "Проверить", "доктор": "Вылечить"}
+    label = labels.get(role, "Выбрать")
+    kb = InlineKeyboardMarkup(row_width=1)
+    for uid in g["alive"]:
+        if role not in ("доктор",) and uid == player_uid:
+            continue
+        name = g["player_names"].get(uid, "?")
+        kb.add(InlineKeyboardButton(
+            f"🎯 {label}: {name}",
+            callback_data=f"maf_n_{lid}_{player_uid}_{uid}"
+        ))
+    return kb
+
+
+def _maf_night(lobby_id: int):
+    g = _maf.get(lobby_id)
     if not g:
         return
     g["phase"] = "night"
     g["night_actions"] = {}
-    # Уведомляем всех
+    bots = g["bots"]
+
+    host = ask_ai_host(
+                f"Ночь {g['day_num']}. Убийцы выходят. 1-2 предложения.",
+                chat_id=lobby_id
+            )
+    night_text = (
+        f"🌙 НОЧЬ {g['day_num']}\n\n"
+        f"🎭 Ведущий: {host}\n\n"
+        f"Город засыпает... Если у тебя особая роль — кнопки придут в личку бота."
+    )
+    _maf_send_all(lobby_id, night_text)
+
+    # Реальным игрокам с ролями — кнопки ночного хода (в ЛС)
     for uid in g["alive"]:
-        role = g["roles"].get(uid)
+        if uid in bots:
+            continue
+        role = g["roles"].get(uid, "мирный")
         if role == "мирный":
-            send(uid, "🌙 НОЧЬ\n\nТы мирный житель. Жди пока проснёшься...")
-        elif role in ("мафия", "шериф", "доктор"):
-            # ИСПРАВЛЕНО: отправляем InlineKeyboard для выбора цели вместо текстового ввода
-            targets = []
-            for p in g["alive"]:
-                if role != "доктор" and p == uid:
-                    continue
-                targets.append(p)
-            action_label = {"мафия": "Убить", "шериф": "Проверить", "доктор": "Вылечить"}[role]
-            kb_night = InlineKeyboardMarkup(row_width=1)
-            for p in targets:
-                pname = g["player_names"].get(p, "?")
-                kb_night.add(InlineKeyboardButton(
-                    f"🎯 {action_label}: {pname}",
-                    callback_data=f"mdm_{lobby_id}_{uid}_{p}"
-                ))
-            action_desc = {"мафия": "кого убить", "шериф": "кого проверить", "доктор": "кого вылечить"}[role]
+            continue
+        desc = {
+            "мафия": "кого убить этой ночью",
+            "маньяк": "кого убить этой ночью",
+            "шериф": "кого проверить",
+            "доктор": "кого спасти"
+        }.get(role, "действие")
+        kb_n = _maf_night_kb(lobby_id, uid)
+        try:
+            bot.send_message(uid,
+                f"🌙 Твой ход! Ты — {role.upper()}\n\nВыбери {desc}:",
+                reply_markup=kb_n
+            )
+        except Exception:
+            pass
+
+    # ИИ-боты делают ночные ходы
+    def _bots_night(_lid=lobby_id):
+        time.sleep(random.uniform(5, 15))
+        g2 = _maf.get(_lid)
+        if not g2 or g2["phase"] != "night":
+            return
+        for bid in list(g2["bots"]):
+            if bid not in g2["alive"] or bid in g2["night_actions"]:
+                continue
+            brole = g2["roles"].get(bid, "мирный")
+            if brole == "мирный":
+                continue
+            if brole == "мафия":
+                targets = [p for p in g2["alive"] if p != bid and g2["roles"].get(p) not in ("мафия","маньяк")]
+            elif brole == "маньяк":
+                targets = [p for p in g2["alive"] if p != bid]
+            elif brole == "шериф":
+                # Шериф старается проверить подозрительных (не-ботов приоритет)
+                real_targets = [p for p in g2["alive"] if p != bid and p not in g2["bots"]]
+                targets = real_targets if real_targets else [p for p in g2["alive"] if p != bid]
+            elif brole == "доктор":
+                # Доктор иногда лечит себя
+                targets = list(g2["alive"])
+            else:
+                continue
+            if not targets:
+                continue
+            target = random.choice(targets)
+            g2["night_actions"][bid] = target
+            time.sleep(random.uniform(2, 6))
+        # Проверяем один раз после всех ботов
+        _pool.submit(_maf_check_night, _lid)
+
+        # Таймаут: если реальные не сходили за 90 секунд — принудительно завершаем ночь
+        time.sleep(90)
+        g3 = _maf.get(_lid)
+        if g3 and g3["phase"] == "night":
+            # Заполняем пропущенные ночные ходы реальных игроков
+            night_roles_t = [p for p in g3["alive"] if g3["roles"].get(p) in ("мафия","шериф","доктор","маньяк")]
+            for p in night_roles_t:
+                if p not in g3["night_actions"] and p not in g3["bots"]:
+                    # Пропуск хода
+                    g3["night_actions"][p] = None
+            _pool.submit(_maf_check_night, _lid)
+    _pool.submit(_bots_night)
+
+
+def _maf_check_night(lobby_id: int):
+    """Проверяет все ли ночные роли сделали ход."""
+    g = _maf.get(lobby_id)
+    if not g or g["phase"] != "night":
+        return
+    night_roles = [p for p in g["alive"] if g["roles"].get(p) in ("мафия","шериф","доктор","маньяк")]
+    if night_roles and not set(night_roles).issubset(set(g["night_actions"].keys())):
+        return
+    # Все ночные роли сходили (или ночных ролей нет) — разбираем утро
+
+    def _morning(_lid=lobby_id):
+        g2 = _maf.get(_lid)
+        if not g2:
+            return
+        bots2 = g2["bots"]
+        actions = g2["night_actions"]
+
+        mafia_kill = None
+        maniac_kill = None
+        doctor_save = None
+
+        for uid, target in actions.items():
+            if target is None:  # игрок пропустил ход
+                continue
+            role = g2["roles"].get(uid)
+            if role == "мафия" and mafia_kill is None:
+                mafia_kill = target
+            elif role == "маньяк":
+                maniac_kill = target
+            elif role == "доктор":
+                doctor_save = target
+            elif role == "шериф" and uid not in bots2:
+                # Шерифу — результат в личку
+                trole = g2["roles"].get(target, "мирный")
+                tname = g2["player_names"].get(target, "?")
+                is_bad = trole in ("мафия", "маньяк")
+                _maf_send_one(uid,
+                    f"🔎 Результат проверки:\n"
+                    f"{'🤖' if target in bots2 else '👤'} {tname} — "
+                    f"{'🔫 МАФИЯ!' if trole=='мафия' else ('🔪 МАНЬЯК!' if trole=='маньяк' else '✅ мирный')}"
+                )
+
+        # Определяем жертв
+        victims = []
+        if mafia_kill and mafia_kill != doctor_save:
+            victims.append(mafia_kill)
+        if maniac_kill and maniac_kill != doctor_save and maniac_kill not in victims:
+            victims.append(maniac_kill)
+
+        # Убираем жертв
+        dead_strs = []
+        for v in victims:
+            vname = g2["player_names"].get(v, "?")
+            vrole = g2["roles"].get(v, "мирный")
+            role_line = MAFIA_ROLE_DESC.get(vrole, "").split("\n")[0]
+            dead_strs.append(f"💀 {vname} ({role_line})")
+            if v in g2["alive"]:
+                g2["alive"].remove(v)
+            _maf_uid.pop(v, None)
+            if v not in bots2:
+                _maf_send_one(v, "💀 Тебя убили этой ночью.\n\nМожешь наблюдать за игрой.")
+
+        # Утреннее объявление
+        if victims:
+            dead_list = "\n".join(dead_strs)
+            host = ask_ai_host(
+                f"Ты ведущий Мафии. Утро дня {g2['day_num']}. "
+                f"Погибли: {', '.join(g2['player_names'].get(v,'?') for v in victims)}. "
+                f"Объяви жутко. НЕ НАЗЫВАЙ роли убитых. 1-2 предложения.",
+                chat_id=_lid
+            )
+            _maf_send_all(_lid,
+                f"☀️ УТРО\n\n🎭 Ведущий: {host}\n\n"
+                f"Этой ночью погибли:\n{dead_list}"
+            )
+        elif doctor_save and (mafia_kill == doctor_save or maniac_kill == doctor_save):
+            host = ask_ai_host(
+                "Утро. Никто не погиб. Объяви с тревогой — это ненадолго. 1 предложение.",
+                chat_id=_lid
+            )
+            _maf_send_all(_lid, f"☀️ УТРО\n\n🎭 Ведущий: {host}\n\nНикто не погиб этой ночью.")
+        else:
+            host = ask_ai_host(
+                "Тихая ночь. Никто не погиб. Объяви — с угрозой. 1 предложение.",
+                chat_id=_lid
+            )
+            _maf_send_all(_lid, f"☀️ УТРО\n\n🎭 Ведущий: {host}\n\nНикто не погиб.")
+
+        g2["night_actions"] = {}
+        winner = _maf_check_win(_lid)
+        if winner:
+            _maf_end(_lid, winner)
+            return
+        time.sleep(2)
+        _maf_day(_lid)
+
+    _pool.submit(_morning)
+
+
+# ─── Победа / конец ────────────────────────────────────────
+
+def _maf_check_win(lobby_id: int):
+    g = _maf.get(lobby_id)
+    if not g:
+        return None
+    alive = g["alive"]
+    roles = g["roles"]
+    mafia_a = [p for p in alive if roles.get(p) == "мафия"]
+    maniac_a = [p for p in alive if roles.get(p) == "маньяк"]
+    others_a = [p for p in alive if roles.get(p) not in ("мафия","маньяк")]
+    if not mafia_a and not maniac_a:
+        return "мирные"
+    if maniac_a and len(maniac_a) >= len([p for p in alive if p not in maniac_a]):
+        return "маньяк"
+    if mafia_a and len(mafia_a) >= len(others_a):
+        return "мафия"
+    return None
+
+
+def _maf_end(lobby_id: int, winner: str):
+    g = _maf.pop(lobby_id, None)
+    if not g:
+        return
+    bots = g["bots"]
+    is_group = _maf_is_group(g)
+
+    # Убираем маппинг группы
+    if is_group:
+        _group_mafia.pop(g.get("chat_id"), None)
+
+    # Очищаем игроков
+    for uid in g["players"]:
+        _maf_uid.pop(uid, None)
+
+    roles_all = "\n".join(
+        f"  👤 {g['player_names'].get(uid,'?')} — {role}"
+        for uid, role in g["roles"].items()
+    )
+    win_text = {
+        "мирные": "🎉 МИРНЫЕ ПОБЕДИЛИ!\nМафия уничтожена!",
+        "мафия":  "🔫 МАФИЯ ПОБЕДИЛА!\nГород во тьме.",
+        "маньяк": "🔪 МАНЬЯК ПОБЕДИЛ!\nВсе пали его жертвами.",
+    }.get(winner, "Игра завершена.")
+
+    finale = ask_ai_host(
+        f"Конец игры. Победители: {winner}. Финальный монолог — мрачно, как тёмный судья. 2-3 предложения.",
+        chat_id=lobby_id
+    )
+
+    final_msg = (
+        f"{win_text}\n\n"
+        f"🎭 Ведущий: {finale}\n\n"
+        f"📋 Все роли:\n{roles_all}"
+    )
+
+    if is_group:
+        send_group(g["chat_id"], final_msg)
+    else:
+        for uid in g["players"]:
+            if uid in bots:
+                continue
+            u = U(uid)
             try:
-                bot.send_message(uid,
-                    f"🌙 НОЧЬ — ТЫ {role.upper()}\n\nВыбери {action_desc}:",
-                    reply_markup=kb_night)
+                send(uid, final_msg, kb=KB(u.get("stage", 0)))
             except Exception:
                 pass
 
-def proc_mafia_dm(uid, text):
-    """Обрабатывает ход мафии в ЛС. True если обработано."""
-    lobby_id = _mafia_player.get(uid)
-    if not lobby_id:
+
+# ─── Обработка текста игрока в ЛС ──────────────────────────
+
+def maf_proc_dm(uid: int, text: str) -> bool:
+    """Обрабатывает сообщение игрока в ЛС мафии. True если поглощено."""
+    lid = _maf_uid.get(uid)
+    if not lid:
         return False
-    g = _mafia_lobby.get(lobby_id)
-    if not g or g.get("state") != "playing":
+    g = _maf.get(lid)
+    if not g or _maf_is_group(g):
         return False
 
     tl = text.strip().lower()
 
-    if tl in ("выйти", "/stop_mafia", "стоп мафия"):
-        del _mafia_player[uid]
-        g["alive"] = [p for p in g["alive"] if p != uid]
-        g["players"] = [p for p in g["players"] if p != uid]
-        send(uid, "Ты вышел из игры мафия.")
-        for p in g["players"]:
-            if p != uid:
-                send(p, f"⚠️ {g['player_names'].get(uid,'?')} вышел из игры.")
-        if len(g["alive"]) < 3:
-            for p in g["players"]:
-                send(p, "Игра завершена — недостаточно игроков.")
-            _end_mafia_dm(lobby_id, "мирные")
+    # Выход
+    if tl in ("/leavem", "выйти из мафии", "/stopm"):
+        _maf_uid.pop(uid, None)
+        name = g["player_names"].get(uid, "?")
+        if uid in g["players"]:
+            g["players"].remove(uid)
+        if uid in g["alive"]:
+            g["alive"].remove(uid)
+            _maf_send_all(lid, f"⚠️ {name} покинул игру.")
+            winner = _maf_check_win(lid)
+            if winner:
+                _maf_end(lid, winner)
+        u = U(uid)
+        _maf_send_one(uid, "Ты вышел из мафии.", kb=KB(u.get("stage", 0)))
         return True
 
-    phase = g.get("phase", "day")
-
-    if phase == "day":
-        if tl == "пропустить":
-            send(uid, "⏭ Ты пропустил голосование.")
-            g["votes"][uid] = None
-            _check_mafia_day_votes(lobby_id)
-            return True
-        # Ищем цель по имени
-        target = _find_mafia_player_by_name(g, tl, exclude=uid)
-        if target:
-            g["votes"][uid] = target
-            voted_name = g["player_names"].get(target, "?")
-            send(uid, f"⚖️ Твой голос: {voted_name}")
-            _check_mafia_day_votes(lobby_id)
-            return True
-        send(uid, "❓ Игрок не найден. Напиши имя из списка живых.")
-        return True
-
-    elif phase == "night":
-        role = g["roles"].get(uid)
-        if role == "мирный":
-            send(uid, "🌙 Ночь. Жди...")
-            return True
-        # Ищем цель
-        target = _find_mafia_player_by_name(g, tl, exclude=(uid if role != "доктор" else None))
-        if not target:
-            send(uid, "❓ Игрок не найден.")
-            return True
-        g["night_actions"][uid] = target
-        target_name = g["player_names"].get(target, "?")
-        action_word = {"мафия":"убить","шериф":"проверить","доктор":"вылечить"}.get(role,"?")
-        send(uid, f"✅ Действие принято: {action_word} {target_name}")
-        _check_mafia_night_actions(lobby_id)
+    # Чат во время игры (не команды)
+    if g["state"] == "playing" and uid in g["alive"] and not tl.startswith("/"):
+        # Сбрасываем режим ИИ-диалога пока идёт мафия (он перехватил бы чат)
+        U(uid)["ai_mode"] = False
+        _maf_chat_broadcast(lid, uid, text)
         return True
 
     return False
 
-def _find_mafia_player_by_name(g, name_query, exclude=None):
-    """Ищет uid игрока по части имени."""
-    for p in g["alive"]:
-        if p == exclude:
-            continue
-        pname = g["player_names"].get(p, "").lower()
-        if name_query in pname or pname in name_query:
-            return p
-    return None
 
-def _check_mafia_day_votes(lobby_id):
-    """Проверяет набрали ли все живые голоса."""
-    g = _mafia_lobby.get(lobby_id)
-    if not g:
-        return
-    voted = set(g["votes"].keys())
-    alive = set(g["alive"])
-    if not alive.issubset(voted):
-        return  # ждём остальных
-    # Подводим итог
-    count = {}
-    for v in g["votes"].values():
-        if v:
-            count[v] = count.get(v, 0) + 1
-    if not count:
-        for uid in g["alive"]:
-            send(uid, "☀️ Голосование: единогласно никого не устранили.")
-    else:
-        eliminated = max(count, key=count.get)
-        elim_name = g["player_names"].get(eliminated, "?")
-        elim_role = g["roles"].get(eliminated, "?")
-        g["alive"].remove(eliminated)
-        role_txt = MAFIA_ROLES.get(elim_role, "?").split("\n")[0]
-        for uid in g["alive"] + [eliminated]:
-            try:
-                send(uid, f"⚖️ Устранён: {elim_name}\nРоль: {role_txt}")
-            except Exception:
-                pass
-    g["votes"] = {}
-    winner = _check_mafia_dm_win(lobby_id)
-    if winner:
-        _end_mafia_dm(lobby_id, winner); return
-    g["day_num"] += 1
-    _mafia_announce_night(lobby_id)
+# ─── ИИ-АТАКА (для админа) ─────────────────────────────────
 
-def _check_mafia_night_actions(lobby_id):
-    """Ждёт пока все ночные роли сделают ход."""
-    g = _mafia_lobby.get(lobby_id)
-    if not g:
-        return
-    night_roles = [p for p in g["alive"] if g["roles"].get(p) in ("мафия","шериф","доктор")]
-    acted = set(g["night_actions"].keys())
-    if not all(p in acted for p in night_roles):
-        return  # ждём
-    # Применяем ночные действия
-    saved_by_doctor = None
-    mafia_target = None
-    sheriff_info = []
-    for uid, target in g["night_actions"].items():
-        role = g["roles"].get(uid)
-        if role == "мафия":
-            mafia_target = target
-        elif role == "доктор":
-            saved_by_doctor = target
-        elif role == "шериф":
-            target_role = g["roles"].get(target, "?")
-            is_mafia = (target_role == "мафия")
-            target_name = g["player_names"].get(target, "?")
-            send(uid, f"🔎 Результат проверки {target_name}: {'🔫 МАФИЯ!' if is_mafia else '👤 мирный'}")
-    # Применяем убийство
-    if mafia_target and mafia_target != saved_by_doctor:
-        victim_name = g["player_names"].get(mafia_target, "?")
-        victim_role = g["roles"].get(mafia_target, "?")
-        g["alive"] = [p for p in g["alive"] if p != mafia_target]
-        role_txt = MAFIA_ROLES.get(victim_role, "?").split("\n")[0]
-        for uid in g["alive"] + [mafia_target]:
-            try:
-                send(uid, f"☀️ УТРО\n\nНочью убит: {victim_name}\nРоль: {role_txt}")
-            except Exception:
-                pass
-    elif mafia_target == saved_by_doctor:
-        saved_name = g["player_names"].get(saved_by_doctor, "?")
-        for uid in g["alive"]:
-            send(uid, f"☀️ УТРО\n\nДоктор спас {saved_name}! Никто не погиб.")
-    else:
-        for uid in g["alive"]:
-            send(uid, "☀️ УТРО\n\nНикто не погиб.")
-    g["night_actions"] = {}
-    winner = _check_mafia_dm_win(lobby_id)
-    if winner:
-        _end_mafia_dm(lobby_id, winner); return
-    _mafia_announce_day(lobby_id)
+_ai_scare_active: dict = {}  # uid → True (жертвы под ИИ-атакой)
 
-def _check_mafia_dm_win(lobby_id):
-    g = _mafia_lobby.get(lobby_id)
-    if not g:
-        return None
-    alive = g["alive"]
-    mafia_alive = [p for p in alive if g["roles"].get(p) == "мафия"]
-    peaceful_alive = [p for p in alive if g["roles"].get(p) != "мафия"]
-    if not mafia_alive:
-        return "мирные"
-    if len(mafia_alive) >= len(peaceful_alive):
-        return "мафия"
-    return None
 
-def _end_mafia_dm(lobby_id, winner):
-    g = _mafia_lobby.pop(lobby_id, None)
-    if not g:
-        return
-    roles_reveal = "\n".join(
-        f"  {g['player_names'].get(uid,'?')} — {role}"
-        for uid, role in g["roles"].items()
-    )
-    if winner == "мирные":
-        result = "🎉 МИРНЫЕ ПОБЕДИЛИ!\n\n"
-    else:
-        result = "🔫 МАФИЯ ПОБЕДИЛА!\n\n"
-    for uid in g["players"]:
-        _mafia_player.pop(uid, None)
-        u = U(uid)
-        try:
-            send(uid, result + "Роли:\n" + roles_reveal, kb=KB(u.get("stage", 0)))
-        except Exception:
-            pass
+def start_ai_scare(target_uid: int):
+    """Запускает ИИ-атаку на жертву. Пишет жутко, отвечает на ответы."""
+    _ai_scare_active[target_uid] = True
+    u = U(target_uid)
+    name = u.get("name") or "ты"
+    city = u.get("city") or ""
+    city_hint = f" Ты живёшь в {city}." if city else ""
 
-# ══════════════════════════════════════════════════════════════
+    def _scare_loop(_uid=target_uid, _name=name):
+        # Первые 3 волны — без ответа пользователя
+        openers = [
+            f"Напиши жертве по имени '{_name}' жуткое первое сообщение. "
+            f"Намекни что следишь.{city_hint} 1-2 предложения.",
+
+            f"Продолжай пугать '{_name}'. Упомяни что знаешь её действия. "
+            f"Будь загадочным. 1 предложение.",
+
+            f"Напиши '{_name}' — финальный жуткий намёк. "
+            f"Скажи что видишь её прямо сейчас. 1 предложение.",
+        ]
+        for prompt in openers:
+            if not _ai_scare_active.get(_uid):
+                return
+            msg = ask_ai(prompt, chat_id=_uid)
+            _maf_send_one(_uid, f"👁 {msg}")
+            time.sleep(random.uniform(12, 25))
+
+    _pool.submit(_scare_loop)
+
+
+def stop_ai_scare(target_uid: int):
+    _ai_scare_active.pop(target_uid, None)
+
+
+def maf_ai_scare_reply(uid: int, text: str) -> bool:
+    """Если жертва под ИИ-атакой — иногда отвечает. True если поглощено."""
+    if not _ai_scare_active.get(uid):
+        return False
+    # Отвечает с вероятностью ~40%
+    if random.random() > 0.40:
+        return False
+    u = U(uid)
+    name = u.get("name") or "ты"
+
+    def _reply(_t=text, _uid=uid, _name=name):
+        time.sleep(random.uniform(3, 10))
+        if not _ai_scare_active.get(_uid):
+            return
+        answer = ask_ai_host(
+                f"Жертва по имени '{_name}' ответила мне: '{_t[:100]}'. "
+            f"Ответь жутко, загадочно, намекни что это всё видишь. 1-2 предложения.",
+                chat_id=_uid
+            )
+        _maf_send_one(_uid, f"👁 {answer}")
+    _pool.submit(_reply)
+    return True
+
 #  v13: КАРТОЧНАЯ ИСТОРИЯ (visual-novel style с выбором персонажа)
 # ══════════════════════════════════════════════════════════════
 
@@ -6361,6 +7946,13 @@ def proc_card_story(uid, text):
                 _render_card_scene(uid)
             return True
 
+    # Выход из истории
+    if text == "❌ Выйти из истории":
+        del _card_story[uid]
+        u = U(uid)
+        send(uid, "История прервана.", kb=KB(u.get("stage", 0)))
+        return True
+
     # Перепоказываем сцену при неправильном вводе
     _render_card_scene(uid)
     return True
@@ -6484,6 +8076,12 @@ def proc_group_card_story(chat_id, uid, text):
                     if next_scene.get("end"):
                         del _group_games[chat_id]
             return True
+
+    # Выход из истории
+    if text == "❌ Выйти из истории":
+        _group_card_story.pop(chat_id, None)
+        send_group(chat_id, "История прервана.", kb=group_reply_kb())
+        return True
 
     return False
 
@@ -6658,6 +8256,9 @@ def proc_group_game(chat_id, uid, text):
     if gm == "card_story":
         return proc_group_card_story(chat_id, uid, text)
 
+    if gm == "ai_story":
+        return proc_group_ai_story(chat_id, uid, text)
+
     if gm == "duel":
         # БАХ обрабатывается отдельно в _handle_group_message
         return False
@@ -6806,7 +8407,7 @@ if __name__ == "__main__":
     admins.add(ADMIN_ID)
 
     print("╔══════════════════════════════════════════╗")
-    print("║     👁  HORROR BOT v17.0 ЗАПУЩЕН  👁     ║")
+    print("║     👁  HORROR BOT v19.0 ЗАПУЩЕН  👁     ║")
     print("╠══════════════════════════════════════════╣")
     print(f"║  Admin ID   : {ADMIN_ID}")
     print(f"║  Стадия     : каждые {STAGE_SEC} сек")
@@ -6823,3 +8424,168 @@ if __name__ == "__main__":
     print("║  Остановка  : Ctrl+C")
     print("╚══════════════════════════════════════════╝")
     run_polling()
+
+# ══════════════════════════════════════════════════════════════
+#  v19: КАРТОЧНАЯ ИСТОРИЯ С ИИ-СЮЖЕТОМ ДЛЯ ГРУППЫ
+#  ИИ сам придумывает каждую сцену. Игра конечная — 5-7 глав.
+# ══════════════════════════════════════════════════════════════
+
+_AI_STORY_MAX_CHAPTERS = 6  # максимум глав
+
+def start_group_ai_story(chat_id):
+    """Запускает карточную историю с ИИ-сюжетом для группы."""
+    if chat_id in _group_games:
+        send_group(chat_id, "⚠️ Сначала заверши текущую игру.")
+        return
+    _group_games[chat_id] = {
+        "game": "ai_story",
+        "state": "genre_select",
+        "chapter": 0,
+        "max_chapters": _AI_STORY_MAX_CHAPTERS,
+        "players": {},       # uid → character_name
+        "votes": {},         # uid → choice_text
+        "story_so_far": [],  # краткие описания глав
+        "genre": None,
+    }
+    kb = InlineKeyboardMarkup(row_width=2)
+    genres = [
+        ("👁 Хоррор", "horror"),
+        ("🔍 Детектив", "detective"),
+        ("🧙 Фэнтези", "fantasy"),
+        ("🚀 Sci-Fi", "scifi"),
+        ("🌑 Мистика", "mystery"),
+        ("💀 Апокалипсис", "apocalypse"),
+    ]
+    for label, gid in genres:
+        kb.add(InlineKeyboardButton(label, callback_data=f"aisg_{chat_id}_{gid}"))
+    send_group(chat_id,
+        "📖 КАРТОЧНАЯ ИСТОРИЯ С ИИ-СЮЖЕТОМ\\n\\n"
+        "ИИ будет придумывать историю по ходу игры на основе ваших выборов.\\n"
+        f"Игра рассчитана на {_AI_STORY_MAX_CHAPTERS} глав.\\n\\n"
+        "Выберите жанр:",
+        kb=kb
+    )
+
+
+def _generate_ai_story_scene(chat_id, genre, story_so_far, chapter, max_chapters, choice_made=None):
+    """Генерирует сцену через ИИ. Возвращает (scene_text, choices_list)."""
+    g = _group_games.get(chat_id)
+    players_desc = ""
+    if g:
+        names = list(g.get("players", {}).values())
+        if names:
+            players_desc = f"Главные герои: {', '.join(names[:4])}. "
+
+    history = " → ".join(story_so_far[-3:]) if story_so_far else "Начало истории."
+    choice_context = f"Игроки выбрали: {choice_made}. " if choice_made else ""
+
+    genre_prompts = {
+        "horror": "хоррор, страх, жуть, паранормальное",
+        "detective": "детектив, расследование, улики, подозреваемые",
+        "fantasy": "фэнтези, магия, приключения, монстры",
+        "scifi": "научная фантастика, технологии, космос, будущее",
+        "mystery": "мистика, тайны, загадки, сверхъестественное",
+        "apocalypse": "постапокалипсис, выживание, опасность, мрак",
+    }
+    genre_hint = genre_prompts.get(genre, "приключение")
+
+    is_final = (chapter >= max_chapters - 1)
+    final_hint = "Это ФИНАЛЬНАЯ глава. Заверши историю ярко." if is_final else f"Это глава {chapter+1} из {max_chapters}."
+
+    prompt = (
+        f"Ты ведущий интерактивной истории в жанре: {genre_hint}. "
+        f"{players_desc}"
+        f"История до этого: {history}. "
+        f"{choice_context}"
+        f"{final_hint} "
+        f"Напиши сцену (3-4 предложения) и {'заверши историю эпично.' if is_final else 'предложи РОВНО 3 варианта выбора для игроков (каждый 3-5 слов). Формат: СЦЕНА: [текст] ВЫБОРЫ: 1.[вариант] 2.[вариант] 3.[вариант]'}"
+    )
+
+    raw = ask_ai(prompt, chat_id=chat_id)
+
+    if is_final:
+        return raw, []
+
+    # Парсим варианты
+    scene_text = raw
+    choices = []
+    if "ВЫБОРЫ:" in raw:
+        parts = raw.split("ВЫБОРЫ:", 1)
+        scene_text = parts[0].replace("СЦЕНА:", "").strip()
+        choices_raw = parts[1].strip()
+        for line in choices_raw.split("\n"):
+            line = line.strip()
+            if line and (line[0].isdigit() or line.startswith("-")):
+                choice = line.lstrip("123456789.-) ").strip()
+                if choice:
+                    choices.append(choice)
+    if not choices:
+        choices = ["Идти вперёд", "Осмотреться", "Позвать на помощь"]
+
+    return scene_text, choices[:3]
+
+
+def _send_ai_story_scene(chat_id):
+    """Генерирует и отправляет текущую сцену."""
+    g = _group_games.get(chat_id)
+    if not g or g.get("game") != "ai_story":
+        return
+
+    chapter = g.get("chapter", 0)
+    max_ch = g.get("max_chapters", _AI_STORY_MAX_CHAPTERS)
+    genre = g.get("genre", "mystery")
+    story_so_far = g.get("story_so_far", [])
+    choice_made = g.get("last_choice")
+
+    scene_text, choices = _generate_ai_story_scene(
+        chat_id, genre, story_so_far, chapter, max_ch, choice_made
+    )
+
+    g["current_choices"] = choices
+    g["votes"] = {}
+    g["last_choice"] = None
+
+    is_final = (chapter >= max_ch - 1)
+
+    if is_final:
+        send_group(chat_id,
+            f"📖 ГЛАВА {chapter+1} — ФИНАЛ\\n\\n"
+            f"{scene_text}\\n\\n"
+            f"🎭 Конец истории! Спасибо за игру.",
+            kb=group_reply_kb()
+        )
+        if GROUP_AUTO_VOICE:
+            _pool.submit(_send_group_voice, chat_id, "История завершена.")
+        del _group_games[chat_id]
+        return
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    for i, ch in enumerate(choices):
+        kb.add(InlineKeyboardButton(f"{'①②③'[i]} {ch}", callback_data=f"aisc_{chat_id}_{i}"))
+
+    players_total = len(g.get("players", {})) or 1
+    send_group(chat_id,
+        f"📖 ГЛАВА {chapter+1}/{max_ch}\\n\\n"
+        f"{scene_text}\\n\\n"
+        f"🗳 Голосуй за следующий шаг (нужно большинство из {players_total}):",
+        kb=kb
+    )
+    if GROUP_AUTO_VOICE:
+        _pool.submit(_send_group_voice, chat_id, scene_text[:120])
+
+
+def proc_group_ai_story(chat_id, uid, text):
+    """Обрабатывает групповую историю с ИИ."""
+    g = _group_games.get(chat_id)
+    if not g or g.get("game") != "ai_story":
+        return False
+    if text in ("❌ Стоп", "❌ Выйти из игры"):
+        del _group_games[chat_id]
+        send_group(chat_id, "История прервана.", kb=group_reply_kb())
+        return True
+    return False
+
+
+# ── Callback-обработчики для AI Story ───────────────────────
+
+# (обрабатываются в on_callback, добавляем ниже)
